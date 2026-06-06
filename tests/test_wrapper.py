@@ -1220,7 +1220,7 @@ async def test_chat_no_generation_config_when_all_omitted(chat_client):
     """생성 파라미터가 모두 없으면 generationConfig 자체가 없어야 한다."""
     client, mock_http = chat_client
     messages = [{"role": "user", "content": "Hi"}]
-    await client.generate(model="gemini-2.5-flash", messages=messages)
+    await client.generate(model="gemini-2.5-pro", messages=messages)
     body = mock_http.last_request["json"]
     assert "generationConfig" not in body
 
@@ -2211,3 +2211,29 @@ def test_chat_generate_url_regional_keeps_prefix(mock_token_provider):
     client = vertex.VertexChatClient()
     url = client._generate_content_url("gemini-2.5-flash", "us-central1")
     assert url.startswith("https://us-central1-aiplatform.googleapis.com/"), url
+
+
+# ---- thinking budget (thinking 모델이 작은 max_tokens에 본문 비는 것 방지) ----
+
+def test_chat_body_includes_thinking_budget_when_set():
+    body = vertex.VertexChatClient._build_request_body(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=20, temperature=None, top_p=None, stop=None, thinking_budget=0,
+    )
+    assert body["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
+
+
+def test_chat_body_omits_thinking_config_when_none():
+    body = vertex.VertexChatClient._build_request_body(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=20, temperature=None, top_p=None, stop=None, thinking_budget=None,
+    )
+    assert "thinkingConfig" not in body.get("generationConfig", {})
+
+
+def test_gemini_35_flash_has_thinking_budget_zero():
+    assert vertex.model_config("gemini-3.5-flash").get("thinking_budget") == 0
+
+
+def test_gemini_25_pro_has_no_thinking_budget():
+    assert vertex.model_config("gemini-2.5-pro").get("thinking_budget") is None

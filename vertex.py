@@ -39,9 +39,11 @@ _BUILTIN_REGISTRY: dict[str, dict[str, Any]] = {
     "gemini-embedding-001": {"api": "predict", "max_instances": 1},
     "gemini-embedding-2": {"api": "embedContent", "location": "global", "max_instances": 1},
     # Chat models
-    "gemini-2.5-flash": {"api": "generateContent", "kind": "chat", "location": "us-central1"},
+    # thinking 모델은 thinking_budget=0으로 사고 토큰을 끈다 -> 작은 max_tokens에도 본문이 비지 않음
+    # (RAGFlow verify가 작은 max_tokens로 호출해 빈 응답->실패하던 문제 방지).
+    "gemini-2.5-flash": {"api": "generateContent", "kind": "chat", "location": "us-central1", "thinking_budget": 0},
     "gemini-2.5-pro": {"api": "generateContent", "kind": "chat", "location": "us-central1"},
-    "gemini-3.5-flash": {"api": "generateContent", "kind": "chat", "location": "global"},
+    "gemini-3.5-flash": {"api": "generateContent", "kind": "chat", "location": "global", "thinking_budget": 0},
 }
 
 def _build_registry() -> dict[str, dict[str, Any]]:
@@ -552,6 +554,7 @@ class VertexChatClient:
         temperature: float | None,
         top_p: float | None,
         stop: str | list[str] | None,
+        thinking_budget: int | None = None,
     ) -> dict[str, Any]:
         """OpenAI messages/params -> Vertex generateContent request body.
 
@@ -588,6 +591,8 @@ class VertexChatClient:
             gen_cfg["topP"] = top_p
         if stop is not None:
             gen_cfg["stopSequences"] = [stop] if isinstance(stop, str) else list(stop)
+        if thinking_budget is not None:
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": thinking_budget}
 
         if gen_cfg:
             body["generationConfig"] = gen_cfg
@@ -621,6 +626,7 @@ class VertexChatClient:
             temperature=temperature,
             top_p=top_p,
             stop=stop,
+            thinking_budget=cfg.get("thinking_budget"),
         )
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -701,6 +707,7 @@ class VertexChatClient:
             temperature=temperature,
             top_p=top_p,
             stop=stop,
+            thinking_budget=cfg.get("thinking_budget"),
         )
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
