@@ -1,7 +1,7 @@
 """래퍼의 변환/라우팅 로직 단위 테스트 (실제 Vertex/GCP 호출 없이).
 
-lifespan을 실제로 돌리되 GoogleAccessTokenProvider/VertexEmbeddingClient를 가짜로
-monkeypatch해서, app.state(semaphore 포함)가 TestClient의 이벤트 루프에서 정상 구성되게 한다.
+lifespan을 실제로 돌리되 VertexEmbeddingClient를 가짜로
+monkeypatch해서, app.state가 TestClient의 이벤트 루프에서 정상 구성되게 한다.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as wrapper
+import vertex
 
 
 # ---- 순수 함수 ----
@@ -31,19 +32,19 @@ def test_coerce_string_inputs_rejects_tokens():
 
 
 def test_chunked_splits_by_size():
-    assert list(wrapper.chunked(["a", "b", "c", "d", "e"], 2)) == [["a", "b"], ["c", "d"], ["e"]]
+    assert list(vertex.chunked(["a", "b", "c", "d", "e"], 2)) == [["a", "b"], ["c", "d"], ["e"]]
 
 
 def test_chunked_size_floor_is_one():
-    assert list(wrapper.chunked(["a", "b"], 0)) == [["a"], ["b"]]
+    assert list(vertex.chunked(["a", "b"], 0)) == [["a"], ["b"]]
 
 
 def test_gemini_001_max_instances_is_one():
-    assert wrapper.KNOWN_MAX_INSTANCES["gemini-embedding-001"] == 1
+    assert vertex.KNOWN_MAX_INSTANCES["gemini-embedding-001"] == 1
 
 
 def test_text_005_max_instances_is_five():
-    assert wrapper.KNOWN_MAX_INSTANCES["text-embedding-005"] == 5
+    assert vertex.KNOWN_MAX_INSTANCES["text-embedding-005"] == 5
 
 
 def test_status_mapping():
@@ -66,36 +67,35 @@ def test_encode_embedding_base64_roundtrip():
 
 # ---- 엔드포인트 (Vertex 호출은 가짜로 대체) ----
 
-class _FakeVertex:
-    """predict()를 흉내. instance(text)당 prediction 하나씩 반환."""
+class _FakeVertexService:
+    """VertexEmbeddingClient 흉내. embed()를 통해 호출 처리."""
 
     def __init__(self, *_a, **_k):
         self.calls: list[list[str]] = []
 
-    async def predict(self, *, model, texts, dimensions, task_type, title, auto_truncate):
-        self.calls.append(list(texts))
-        return [
-            {"embeddings": {"values": [0.1, 0.2, 0.3], "statistics": {"token_count": 2}}}
-            for _ in texts
-        ]
+    async def embed(self, *, model, texts, dimensions, task_type, title):
+        # 원본 배치 로직 테스트를 위해 청크 크기를 여기서 흉내 냄
+        batch_size = vertex.KNOWN_MAX_INSTANCES.get(model, vertex.DEFAULT_MAX_INSTANCES)
+        self.calls.extend(list(vertex.chunked(texts, batch_size)))
+        
+        # 전체 텍스트에 대한 응답 반환 (원래 gather에서 합쳐지는 형태)
+        chunk_results = []
+        for chunk in vertex.chunked(texts, batch_size):
+            chunk_results.append([
+                {"embeddings": {"values": [0.1, 0.2, 0.3], "statistics": {"token_count": 2}}}
+                for _ in chunk
+            ])
+        return chunk_results
 
     async def close(self):
         pass
 
 
-class _FakeTokenProvider:
-    project_id = "test-project"
-
-    def __init__(self, *_a, **_k):
-        pass
-
-
 @pytest.fixture
 def client_with_fake(monkeypatch):
-    fake = _FakeVertex()
-    # 실제 lifespan이 돌되 GCP 의존성만 가짜로 교체 -> semaphore 등 app.state가 in-loop 구성됨.
-    monkeypatch.setattr(wrapper, "GoogleAccessTokenProvider", _FakeTokenProvider)
-    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda _tp: fake)
+    fake = _FakeVertexService()
+    # app.py의 lifespan에서 생성되는 VertexEmbeddingClient 교체
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake)
     with TestClient(wrapper.app) as c:
         yield c, fake
 
