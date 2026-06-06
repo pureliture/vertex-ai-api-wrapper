@@ -42,10 +42,10 @@ _BUILTIN_REGISTRY: dict[str, dict[str, Any]] = {
     # thinking 모델은 thinking_budget=0으로 사고 토큰을 끈다 -> 작은 max_tokens에도 본문이 비지 않음
     # (RAGFlow verify가 작은 max_tokens로 호출해 빈 응답->실패하던 문제 방지).
     "gemini-2.5-flash": {"api": "generateContent", "kind": "chat", "location": "us-central1", "thinking_budget": 0},
-    "gemini-2.5-flash-thinking": {"api": "generateContent", "kind": "chat", "location": "us-central1"},
+    "gemini-2.5-flash-thinking": {"api": "generateContent", "kind": "chat", "location": "us-central1", "vertex_model": "gemini-2.5-flash"},
     "gemini-2.5-pro": {"api": "generateContent", "kind": "chat", "location": "us-central1"},
     "gemini-3.5-flash": {"api": "generateContent", "kind": "chat", "location": "global", "thinking_budget": 0},
-    "gemini-3.5-flash-thinking": {"api": "generateContent", "kind": "chat", "location": "global"},
+    "gemini-3.5-flash-thinking": {"api": "generateContent", "kind": "chat", "location": "global", "vertex_model": "gemini-3.5-flash"},
 }
 
 def _build_registry() -> dict[str, dict[str, Any]]:
@@ -112,6 +112,9 @@ def model_config(model: str) -> dict[str, Any] | None:
         cfg["max_instances"] = DEFAULT_MAX_INSTANCES
     if "kind" not in cfg:
         cfg["kind"] = _API_DEFAULT_KIND.get(cfg.get("api", ""), "embedding")
+    # vertex_model: Vertex API에 전송할 실제 모델 ID. 미지정 시 레지스트리 키(=클라이언트 모델명).
+    if "vertex_model" not in cfg:
+        cfg["vertex_model"] = model
     return cfg
 
 
@@ -669,11 +672,12 @@ class VertexChatClient:
         Returns:
             {"text": str, "finish_reason": str, "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}}
         """
-        cfg = model_config(model) or {"location": VERTEX_LOCATION}
+        cfg = model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
         location = cfg.get("location", VERTEX_LOCATION)
+        vertex_model = cfg.get("vertex_model", model)
 
         token = await self.token_provider.get_token()
-        url = self._generate_content_url(model, location)
+        url = self._generate_content_url(vertex_model, location)
 
         body = self._build_request_body(
             messages=messages,
@@ -752,11 +756,12 @@ class VertexChatClient:
         스트림 시작 전 Vertex 4xx/5xx면 VertexAPIError를 raise한다.
         스트림 도중 끊김/파싱 실패는 방어적으로 해당 줄을 건너뛴다.
         """
-        cfg = model_config(model) or {"location": VERTEX_LOCATION}
+        cfg = model_config(model) or {"location": VERTEX_LOCATION, "vertex_model": model}
         location = cfg.get("location", VERTEX_LOCATION)
+        vertex_model = cfg.get("vertex_model", model)
 
         token = await self.token_provider.get_token()
-        url = self._stream_generate_content_url(model, location)
+        url = self._stream_generate_content_url(vertex_model, location)
 
         body = self._build_request_body(
             messages=messages,
