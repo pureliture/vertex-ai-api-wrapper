@@ -1,128 +1,169 @@
-# vertex-ai-api-wrapper
+<div align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&height=200&section=header&text=vertex-ai-api-wrapper&fontSize=40" width="100%"/>
+</div>
 
-Google Cloud **Vertex AI (Gemini Enterprise Agent Platform)** 임베딩을 **OpenAI 호환 `/v1/embeddings`** 로 노출하는 얇은 프록시.
-RAGFlow 0.25.6의 **"OpenAI-API-Compatible"** 임베딩 provider에서 Vertex 임베딩을 쓰기 위해 만든다.
+<div align="center">
+  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
+  <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Google_Cloud-4285F4?style=for-the-badge&logo=google-cloud&logoColor=white"/>
+  <img src="https://img.shields.io/badge/RAGFlow-FF4F00?style=for-the-badge&logo=ragflow&logoColor=white"/>
+</div>
 
-RAGFlow 0.25.6에는 Vertex 임베딩 네이티브 메뉴가 없고(“Google Cloud” provider는 채팅 전용, “Gemini”는 AI Studio API 키 전용),
-AI Studio를 쓸 수 없는 환경에서는 이 래퍼가 유일한 경로다.
+<br/>
+<div align="center">
+  <b>Google Cloud Vertex AI 임베딩 및 Rerank API를 RAGFlow(OpenAI/LocalAI 규격)에서 사용할 수 있게 해주는 프록시 서버입니다.</b>
+</div>
+<br/>
 
-## 동작
+<div align="center">
+  <a href="#-시스템-아키텍처">🏛️ 시스템 아키텍처</a> &nbsp;|&nbsp;
+  <a href="#-빠른-시작">🚀 빠른 시작</a> &nbsp;|&nbsp;
+  <a href="#-환경-변수-설정">⚙️ 환경 변수 설정</a> &nbsp;|&nbsp;
+  <a href="#-ragflow-연동-가이드">🎯 RAGFlow 연동</a> &nbsp;|&nbsp;
+  <a href="#-api-참조">📡 API 참조</a>
+</div>
 
-```
-RAGFlow ──POST /v1/embeddings (OpenAI)──▶ 래퍼 ──:predict + Bearer token──▶ Vertex AI
-        ◀──{data:[{embedding}]}─────────       ◀──{predictions:[{embeddings}]}──
-```
+---
 
-- 인증: 서비스 계정(ADC)에서 1시간짜리 OAuth2 access token을 `google-auth`가 자동 발급·캐시·갱신. **리프레시 토큰을 직접 다루지 않는다.**
-- 배치 분할: RAGFlow는 요청당 **16개** 텍스트를 보낸다. Vertex 요청당 instance 한도에 맞춰 자동으로 쪼개 병렬 호출한다.
 
-| 모델 | API | 요청당 한도 | 기본 차원 |
-|---|---|---|---|
-| `gemini-embedding-2` | embedContent(global) | **1개** | 3072 (축소 가능, 멀티모달 최신) |
-| `gemini-embedding-001` | predict | **1개** | 3072 (축소 가능) |
-| `text-embedding-005` | predict | **5개** | 768 |
-| `text-multilingual-embedding-002` | predict | **5개** | 768 |
+<br/>
 
-> 한도 출처: Google Vertex AI 공식문서 + 실 API 호출 확인 (2026-06).
+<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%"/>
 
-### 새 모델 추가 = 코드 수정 없이 설정만
-모델 라우팅은 `vertex.py`의 config-driven 레지스트리가 담당한다. 새 모델은 env로 추가:
-- `EXTRA_MODELS=text-embedding-006` — predict 계열 모델 한 줄 추가
-- `MODEL_REGISTRY_JSON='{"새모델":{"api":"embedContent","location":"global","max_instances":1}}'` — 다른 API 계열까지 전체 지정
-Vertex 임베딩 API 계열은 `predict`/`embedContent` 둘뿐이라, 두 어댑터로 모든 모델을 설정만으로 커버한다.
+## 🏛️ 시스템 아키텍처
 
-## 실행 (로컬, uv)
+<!-- docs/images/architecture.svg 위치에 다이어그램 삽입 -->
 
-```bash
-cp .env.example .env        # 값 채우기 (VERTEX_PROJECT 등)
-export GOOGLE_APPLICATION_CREDENTIALS=/path/vertex-sa.json
-export VERTEX_PROJECT=your-gcp-project
-export VERTEX_LOCATION=us-central1
+### 🎨 핵심 설계 포인트
 
-uv sync
-uv run uvicorn app:app --host 0.0.0.0 --port 8930
-```
+<table width="100%">
+  <tr>
+    <td width="50%">
+      <h3>🟦 Drop-in Replacement</h3>
+      <p>기존 OpenAI/LocalAI 생태계 코드 변경 없이 Vertex AI를 그대로 사용 가능합니다.</p>
+    </td>
+    <td width="50%">
+      <h3>🟩 Native Reranking</h3>
+      <p>RAGFlow의 <code>LocalAI</code> provider 규격을 통해 Vertex AI Search Ranking API를 완벽하게 연결합니다.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <h3>🟪 Auto-Batching</h3>
+      <p>RAGFlow의 고정 배치(16개)를 Vertex AI의 모델별 한도(1~5개)에 맞춰 자동 분할 및 병렬 처리합니다.</p>
+    </td>
+    <td width="50%">
+      <h3>🟧 Auth Abstraction</h3>
+      <p>리프레시 토큰 관리 없이 ADC(Application Default Credentials) 서비스 계정을 통해 자동으로 OAuth2 토큰을 발급받습니다.</p>
+    </td>
+  </tr>
+</table>
 
-동작 확인:
+<br/>
 
-```bash
-curl -s http://localhost:8930/v1/embeddings \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"text-embedding-005","input":["hello","world"]}' | head
-```
+<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%"/>
 
-## 실행 (Docker)
+## ⚙️ 환경 변수 설정 (Configuration)
 
-```bash
-docker build -t wrapper-vertex-ai-api .
-docker run -p 8930:80 \
-  -e VERTEX_PROJECT=your-gcp-project \
-  -e VERTEX_LOCATION=us-central1 \
-  -e GOOGLE_APPLICATION_CREDENTIALS=/app/secrets/vertex-sa.json \
-  -v /path/vertex-sa.json:/app/secrets/vertex-sa.json:ro \
-  wrapper-vertex-ai-api
-```
+`.env` 파일을 생성하거나 컨테이너 환경 변수로 다음 값을 주입합니다.
 
-## RAGFlow 등록 (Settings → Model providers → OpenAI-API-Compatible)
-
-| 항목 | 값 |
-|---|---|
-| Model type | `Embedding` |
-| Model name | `gemini-embedding-001` (또는 `text-embedding-005`) — Vertex 공식 모델명 그대로 |
-| Base url | `http://wrapper-vertex-ai-api` ⚠️ **끝 슬래시 금지** (RAGFlow와 같은 docker 망, 컨테이너 이름·포트 없음) |
-| API-Key | `.env`의 `WRAPPER_API_KEY` 값 (비웠으면 빈칸) |
-| Max tokens | `2048` |
-
-### ⚠️ Base url 함정
-RAGFlow 0.25.6은 입력 주소 끝에 `v1`을 자동으로 붙인다(`urljoin(base_url, "v1")`).
-
-| 입력 | 실제 호출 | |
+| Variable | Default | Description |
 |---|---|---|
-| `http://wrapper-vertex-ai-api` | `/v1/embeddings` | ✅ |
-| `http://wrapper-vertex-ai-api/v1` | `/v1/embeddings` | ✅ |
-| `http://wrapper-vertex-ai-api/v1/` | `/v1/v1/embeddings` | ❌ 끝 슬래시 금지 |
+| `GOOGLE_APPLICATION_CREDENTIALS` | `""` | GCP 서비스 계정 JSON 키 경로 (필요 권한: `roles/aiplatform.user`). |
+| `VERTEX_PROJECT` | *(Required)* | GCP 프로젝트 ID. |
+| `VERTEX_LOCATION` | `us-central1` | Vertex API를 호출할 GCP 리전. |
+| `WRAPPER_API_KEY` | `""` | 래퍼 서버를 보호하기 위한 선택적 API 키 (Bearer Token). |
+| `VERTEX_TASK_TYPE_DEFAULT` | `RETRIEVAL_DOCUMENT` | 텍스트 임베딩을 위한 기본 Task Type. |
+| `VERTEX_AUTO_TRUNCATE` | `true` | 토큰 제한 초과 시 400 에러 대신 자동으로 입력 텍스트를 자를지 여부. |
+| `MAX_CONCURRENCY` | `8` | Vertex API에 대한 최대 동시 HTTP 요청 수. |
+| `HTTP_TIMEOUT_SECONDS` | `60` | Vertex API HTTP 요청 타임아웃. |
+| `TOKEN_REFRESH_SKEW_SECONDS` | `300` | Google OAuth 토큰 만료 전 사전 갱신 시간 (초). |
+| `EXTRA_MODELS` | `""` | 콤마(,)로 구분된 추가 지원 모델 목록. |
+| `MODEL_REGISTRY_JSON` | `""` | 복잡한 모델 라우팅을 위한 JSON 설정. |
+| `DEFAULT_MAX_INSTANCES` | `1` | 알 수 없는 모델에 대한 병렬 호출 시 기본 청크 크기. |
 
-### 접근 경로 (컨테이너 80 listen, 호스트 8930:80 공개)
-| 접근 주체 | 주소 |
-|---|---|
-| RAGFlow (같은 docker 망) | `http://wrapper-vertex-ai-api` (포트 없음) |
-| 호스트/도커망 밖 (맥미니 등) | `http://<ubuntu-host>:8930` |
+<details>
+<summary><b>💡 복잡한 모델 라우팅 추가 방법</b></summary>
+<p>새로운 모델은 <code>EXTRA_MODELS</code> 환경 변수에 콤마로 구분하여 추가하거나, <code>MODEL_REGISTRY_JSON</code>을 통해 구체적인 API 타입, 리전, max_instances 등을 제어할 수 있습니다.</p>
+</details>
 
-호스트 공개가 불필요하면 `docker-compose.yml`의 `ports:` 줄을 지우면 된다(충돌 0, 단 호스트 직접 접근 불가).
+<br/>
 
-## 범용 OpenAI 호환 (RAGFlow 외 다른 클라이언트)
+<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%"/>
 
-이 래퍼는 OpenAI 임베딩 표준을 구현하므로 RAGFlow뿐 아니라 OpenAI 호환 임베딩 클라이언트
-전반(LangChain, LlamaIndex, Dify, Open WebUI, LiteLLM, 직접 `openai` SDK)에 그대로 붙는다.
+## 🎯 RAGFlow 연동 가이드
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://<host>:8930/v1", api_key="<WRAPPER_API_KEY 또는 아무값>")
-# encoding_format 미지정 -> openai SDK 기본 base64 전송 -> 래퍼가 처리 (drop-in)
-r = client.embeddings.create(model="text-embedding-005", input=["hello", "world"])
-print(len(r.data), len(r.data[0].embedding))
+래퍼 서버를 RAGFlow에 연결하기 위한 필수 설정입니다.
+
+### 1. Rerank 연동 (**LocalAI Provider** 사용)
+
+Vertex AI의 검색 랭킹 모델을 사용하려면, 반드시 **LocalAI** 프로바이더로 등록해야 합니다.
+
+| 항목 | 설정 값 | 비고 |
+|---|---|---|
+| Model Type | `Rerank` | 반드시 **Rerank** 선택 |
+| Model Name | `semantic-ranker-512` 등 | Vertex API의 Rank 모델명 |
+| Base URL | `http://wrapper-vertex-ai-api` | ⚠️ **끝에 슬래시(`/`) 금지** |
+
+> **💡 Base URL 함정 주의**: RAGFlow는 내부적으로 `urljoin(base_url, "v1")`을 수행합니다. Base URL 끝에 슬래시가 있으면 `/v1/v1/rerank`로 잘못 호출되어 에러가 발생하므로 절대 포함하지 마세요.
+
+### 2. Embedding 연동 (**OpenAI-API-Compatible** 사용)
+
+임베딩 모델은 **OpenAI-API-Compatible** 프로바이더로 등록합니다.
+
+| 항목 | 설정 값 | 비고 |
+|---|---|---|
+| Model Type | `Embedding` | |
+| Model Name | `text-embedding-004` 등 | |
+| Base URL | `http://wrapper-vertex-ai-api` | ⚠️ **끝에 슬래시(`/`) 금지** |
+
+<br/>
+
+<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%"/>
+
+## 🚀 빠른 시작
+
+### ⚡ 요구사항
+- uv
+- Docker 및 Docker Compose
+- GCP 서비스 계정 JSON 키 파일 (`roles/aiplatform.user`)
+
+### 🧪 로컬 환경 (uv 사용)
+
+```bash
+# 의존성 설치 및 백엔드 서버 실행
+uv run uvicorn app:app --reload --port 8000
 ```
 
-지원 항목:
-- `POST /v1/embeddings` — `encoding_format`: `float`(list) / `base64`(float32 LE, SDK 기본) 둘 다.
-- `GET /v1/models`, `GET /v1/models/{id}` — 모델 목록/조회(일부 클라이언트가 프로브).
-- 에러는 OpenAI 포맷(`{"error":{"message","type","code","param"}}`). 요청 검증 실패도 422가 아닌 OpenAI 400으로 변환.
-- CORS 허용(브라우저 클라이언트 OPTIONS preflight), trailing-slash 리다이렉트 비활성.
-- `model`은 레지스트리(`EXTRA_MODELS`/`MODEL_REGISTRY_JSON`로 확장)에 등록된 것만 허용 — 미등록 모델은 404(경로 주입 방지).
+### 🐳 Docker Compose 환경
 
-## 옵션 (요청 헤더)
+```bash
+# 백그라운드 컨테이너 빌드 및 실행
+docker compose up -d --build
+```
 
-- `X-Vertex-Task-Type`: 호출별 task_type 덮어쓰기 (기본 `RETRIEVAL_DOCUMENT`).
-  - 쿼리 임베딩 품질을 따로 올리려면 RAGFlow 쿼리 경로에 `RETRIEVAL_QUERY`를 보내야 하나,
-    순수 OpenAI 인터페이스엔 문서/쿼리 구분 필드가 없다(현재 한계).
-- `X-Vertex-Title`: 문서 임베딩 title.
+<br/>
 
-## 주의
+<img src="https://capsule-render.vercel.app/api?type=rect&color=gradient&height=2" width="100%"/>
 
-- **차원 고정**: RAGFlow는 지식베이스 첫 임베딩의 차원으로 벡터DB 스키마를 고정한다. KB 생성 후 `dimensions`를 바꾸면 충돌 → 인덱스 재생성 필요.
-- **할당량(429)**: 대량 색인 시 Vertex 리전 quota에 걸릴 수 있다. 필요 시 백오프 재시도/quota 증설.
-- **IAM 최소 권한**: 서비스 계정에 `roles/aiplatform.user`만 부여.
+## 📡 API 참조
 
-## 설계 근거
+이 래퍼는 아래와 같은 호환 엔드포인트를 제공합니다.
 
-`Docs/` 의 딥리서치 2건 + RAGFlow v0.25.6 소스(`rag/llm/embedding_model.py`) + Google 공식문서 교차검증 결과를 반영했다.
+| Method | Endpoint | 호환 규격 | 반환 형식 |
+|---|---|---|---|
+| <img src="https://img.shields.io/badge/POST-009688?style=flat-square"/> | `/v1/embeddings` | OpenAI 호환 | `encoding_format` 지원 |
+| <img src="https://img.shields.io/badge/POST-009688?style=flat-square"/> | `/v1/chat/completions` | OpenAI 호환 | SSE Stream 지원 |
+| <img src="https://img.shields.io/badge/POST-009688?style=flat-square"/> | `/v1/rerank` | Cohere / LocalAI 호환 | `results[{index, relevance_score}]` |
+
+<br/>
+
+<div align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&height=100&section=footer"/>
+</div>
+
+<div align="center">
+  <a href="#-시스템-아키텍처">🏛️ 아키텍처</a> &nbsp;|&nbsp;
+  <a href="#-빠른-시작">🚀 빠른 시작</a> &nbsp;|&nbsp;
+  <a href="#top">⬆️ 맨 위로</a>
+</div>

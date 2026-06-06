@@ -596,15 +596,48 @@ class _FakeVertexChatService:
         pass
 
 
+class _FakeVertexRerankService:
+    def __init__(self, *_a, **_k):
+        self.calls = []
+
+    async def rank(self, *, model, query, records, top_n, ignore_record_details_in_response, location):
+        self.calls.append({
+            "model": model, "query": query, "records": records, "top_n": top_n, "location": location
+        })
+        if query == "error":
+            raise vertex.VertexAPIError(502, "Mocked error", code="bad_gateway")
+        return [
+            {"id": "0", "score": 0.99},
+            {"id": "1", "score": 0.50},
+        ]
+
+    async def close(self):
+        pass
+
+
 @pytest.fixture
 def client_with_fake(monkeypatch):
     fake = _FakeVertexService()
     fake_chat = _FakeVertexChatService()
-    # app.py의 lifespan에서 생성되는 VertexEmbeddingClient / VertexChatClient 교체
+    fake_rerank = _FakeVertexRerankService()
+    # app.py의 lifespan에서 생성되는 클라이언트 교체
     monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake)
     monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
     with TestClient(wrapper.app) as c:
         yield c, fake
+
+
+@pytest.fixture
+def client_with_rerank_fake(monkeypatch):
+    fake = _FakeVertexService()
+    fake_chat = _FakeVertexChatService()
+    fake_rerank = _FakeVertexRerankService()
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake)
+    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
+    with TestClient(wrapper.app) as c:
+        yield c, fake_rerank
 
 
 def test_embeddings_order_and_usage(client_with_fake):
@@ -1430,8 +1463,10 @@ def chat_app_client(monkeypatch):
     """chat completions 엔드포인트 테스트용 TestClient."""
     fake_chat = _FakeChatService()
     fake_embed = _FakeVertexService()
+    fake_rerank = _FakeVertexRerankService()
     monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
     monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
     with TestClient(wrapper.app) as c:
         yield c, fake_chat
 
@@ -1752,8 +1787,10 @@ class _FakeStreamingChatService:
 def streaming_chat_app_client(monkeypatch):
     fake_chat = _FakeStreamingChatService()
     fake_embed = _FakeVertexService()
+    fake_rerank = _FakeVertexRerankService()
     monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
     monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
     with TestClient(wrapper.app) as c:
         yield c, fake_chat
 
@@ -1944,8 +1981,10 @@ class _RealChatClientRaising4xx:
 def raising_stream_app_client(monkeypatch):
     fake_chat = _RealChatClientRaising4xx()
     fake_embed = _FakeVertexService()
+    fake_rerank = _FakeVertexRerankService()
     monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
     monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    monkeypatch.setattr(wrapper, "VertexRerankClient", lambda: fake_rerank)
     with TestClient(wrapper.app) as c:
         yield c, fake_chat
 
@@ -2450,3 +2489,201 @@ async def test_stream_chat_json_schema_reaches_vertex_body():
     actual_schema = gen_cfg.get("responseJsonSchema")
     assert actual_schema is not None
     assert actual_schema["properties"]["color"]["enum"] == ["red", "green", "blue"]
+
+
+# ---- Rerank Tests ----
+
+def test_rerank_success(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": ["doc1", "doc2"],
+        "top_n": 2
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    res = r.json()
+    assert "results" in res
+    assert len(res["results"]) == 2
+    assert res["results"][0]["index"] == 0
+    assert res["results"][0]["relevance_score"] == 0.99
+    
+    # Verify mock calls
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["query"] == "hello"
+    assert fake.calls[0]["top_n"] == 2
+    assert fake.calls[0]["location"] == "global"
+    assert len(fake.calls[0]["records"]) == 2
+    assert fake.calls[0]["records"][0]["content"] == "doc1"
+    assert fake.calls[0]["records"][1]["content"] == "doc2"
+
+def test_rerank_documents_with_dict(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": [{"text": "doc1"}, {"text": "doc2"}]
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    assert fake.calls[0]["records"][0]["content"] == "doc1"
+    assert fake.calls[0]["records"][1]["content"] == "doc2"
+
+def test_rerank_empty_documents(client_with_rerank_fake):
+    client, _ = client_with_rerank_fake
+    r = client.post("/v1/rerank", json={"model": "semantic-ranker-512@latest", "query": "hello", "documents": []})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "empty_documents"
+
+def test_rerank_invalid_model(client_with_rerank_fake):
+    client, _ = client_with_rerank_fake
+    r = client.post("/v1/rerank", json={"model": "invalid-model", "query": "hello", "documents": ["doc"]})
+    assert r.status_code == 404
+
+def test_rerank_wrong_kind_model(client_with_rerank_fake):
+    client, _ = client_with_rerank_fake
+    # Use embedding model for rerank
+    r = client.post("/v1/rerank", json={"model": "text-embedding-005", "query": "hello", "documents": ["doc"]})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_model"
+
+def test_rerank_vertex_api_error(client_with_rerank_fake):
+    client, _ = client_with_rerank_fake
+    r = client.post("/v1/rerank", json={"model": "semantic-ranker-512@latest", "query": "error", "documents": ["doc"]})
+    assert r.status_code == 502
+
+# ---- Edge Case & Stress Tests for Rerank ----
+
+def test_rerank_missing_text_key_in_dict_document(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": [{"wrong_key": "val"}]
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    assert fake.calls[0]["records"][0]["content"] == ""
+
+def test_rerank_empty_query(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "",
+        "documents": ["doc"]
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    assert fake.calls[0]["query"] == ""
+
+def test_rerank_null_query(client_with_rerank_fake):
+    client, _ = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": None,
+        "documents": ["doc"]
+    }
+    r = client.post("/v1/rerank", json=payload)
+    # the custom exception handler converts 422 to 400
+    assert r.status_code == 400
+
+def test_rerank_missing_query(client_with_rerank_fake):
+    client, _ = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "documents": ["doc"]
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 400
+
+def test_rerank_negative_top_n(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": ["doc"],
+        "top_n": -1
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    assert fake.calls[0]["top_n"] == -1
+
+def test_rerank_zero_top_n(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": ["doc"],
+        "top_n": 0
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    assert fake.calls[0]["top_n"] == 0
+
+def test_rerank_large_top_n(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": ["doc"],
+        "top_n": 1000000
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    assert fake.calls[0]["top_n"] == 1000000
+
+def test_rerank_empty_document_string(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": ["", "   "]
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    assert fake.calls[0]["records"][0]["content"] == ""
+    assert fake.calls[0]["records"][1]["content"] == "   "
+
+def test_rerank_missing_documents(client_with_rerank_fake):
+    client, _ = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello"
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 400
+
+def test_rerank_null_documents(client_with_rerank_fake):
+    client, _ = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": None
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 400
+
+
+def test_rerank_documents_with_integers(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": [1, 2, 3]
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 400
+
+def test_rerank_top_n_string(client_with_rerank_fake):
+    client, fake = client_with_rerank_fake
+    payload = {
+        "model": "semantic-ranker-512@latest",
+        "query": "hello",
+        "documents": ["doc"],
+        "top_n": "2"
+    }
+    r = client.post("/v1/rerank", json=payload)
+    assert r.status_code == 200
+    assert fake.calls[0]["top_n"] == 2
+

@@ -27,6 +27,7 @@ from vertex import (
     VertexAPIError,
     VertexChatClient,
     VertexEmbeddingClient,
+    VertexRerankClient,
     allowed_models,
     model_config,
 )
@@ -80,6 +81,15 @@ class OpenAIChatRequest(BaseModel):
     response_format: dict[str, Any] | None = None
 
 
+class CohereRerankRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    query: str
+    documents: list[str | dict[str, Any]]
+    top_n: int | None = None
+
+
 def openai_error_response(
     *,
     message: str,
@@ -124,11 +134,13 @@ def encode_embedding(values: list[float], fmt: str) -> list[float] | str:
 async def lifespan(app: FastAPI):
     app.state.vertex_client = VertexEmbeddingClient()
     app.state.vertex_chat_client = VertexChatClient()
+    app.state.vertex_rerank_client = VertexRerankClient()
     try:
         yield
     finally:
         await app.state.vertex_client.close()
         await app.state.vertex_chat_client.close()
+        await app.state.vertex_rerank_client.close()
 
 
 app = FastAPI(title="Vertex AI OpenAI-Compatible Embeddings Wrapper", version="0.1.0", lifespan=lifespan)
@@ -485,3 +497,83 @@ async def create_chat_completions(
         ],
         "usage": result["usage"],
     }
+
+
+@app.post("/v1/rerank", response_model=None)
+async def rerank(
+    payload: CohereRerankRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse | dict[str, Any]:
+    if WRAPPER_API_KEY and authorization != f"Bearer {WRAPPER_API_KEY}":
+        return openai_error_response(
+            message="Invalid wrapper API key.",
+            status_code=401,
+            error_type="authentication_error",
+            code="invalid_api_key",
+        )
+
+    if payload.model not in ALLOWED_MODELS:
+        return openai_error_response(
+            message=f"The model '{payload.model}' does not exist.",
+            status_code=404,
+            error_type="invalid_request_error",
+            code="model_not_found",
+            param="model",
+        )
+
+    _rank_cfg = model_config(payload.model)
+    if _rank_cfg and _rank_cfg.get("kind") != "rerank":
+        return openai_error_response(
+            message=f"The model '{payload.model}' is not a rerank model.",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_model",
+            param="model",
+        )
+
+    if not payload.documents:
+        return openai_error_response(
+            message="documents must not be empty.",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="empty_documents",
+            param="documents",
+        )
+
+    rerank_client: VertexRerankClient = request.app.state.vertex_rerank_client
+
+    records: list[dict[str, Any]] = []
+    for i, doc in enumerate(payload.documents):
+        content = doc.get("text", "") if isinstance(doc, dict) else str(doc)
+        records.append({"id": str(i), "content": content})
+
+    try:
+        records_out = await rerank_client.rank(
+            model=payload.model,
+            query=payload.query,
+            records=records,
+            top_n=payload.top_n,
+            ignore_record_details_in_response=True,
+            location=_rank_cfg.get("location", "global") if _rank_cfg else "global",
+        )
+    except VertexAPIError as exc:
+        return openai_error_response(
+            message=exc.message,
+            status_code=exc.status_code,
+            error_type=map_vertex_status_to_openai_type(exc.status_code),
+            code=exc.code,
+        )
+
+    results = []
+    for r in records_out:
+        try:
+            idx = int(r.get("id", "0"))
+        except ValueError:
+            idx = 0
+        results.append({
+            "index": idx,
+            "relevance_score": float(r.get("score", 0.0))
+        })
+
+    return {"results": results}

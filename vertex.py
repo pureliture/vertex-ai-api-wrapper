@@ -24,13 +24,14 @@ DEFAULT_MAX_INSTANCES = int(os.getenv("DEFAULT_MAX_INSTANCES", "1"))
 # Model registry (config-driven)
 # ---------------------------------------------------------------------------
 
-_SUPPORTED_APIS = {"predict", "embedContent", "generateContent"}
+_SUPPORTED_APIS = {"predict", "embedContent", "generateContent", "rank"}
 
 # kind 기본값 결정: api별 default kind
 _API_DEFAULT_KIND: dict[str, str] = {
     "predict": "embedding",
     "embedContent": "embedding",
     "generateContent": "chat",
+    "rank": "rerank",
 }
 
 _BUILTIN_REGISTRY: dict[str, dict[str, Any]] = {
@@ -38,6 +39,9 @@ _BUILTIN_REGISTRY: dict[str, dict[str, Any]] = {
     "text-multilingual-embedding-002": {"api": "predict", "max_instances": 5},
     "gemini-embedding-001": {"api": "predict", "max_instances": 1},
     "gemini-embedding-2": {"api": "embedContent", "location": "global", "max_instances": 1},
+    "semantic-ranker-512@latest": {"api": "rank", "location": "global"},
+    "semantic-ranker-default-004": {"api": "rank", "location": "global"},
+    "semantic-ranker-fast-004": {"api": "rank", "location": "global"},
     # Chat models
     # thinking 모델은 thinking_budget=0으로 사고 토큰을 끈다 -> 작은 max_tokens에도 본문이 비지 않음
     # (RAGFlow verify가 작은 max_tokens로 호출해 빈 응답->실패하던 문제 방지).
@@ -104,7 +108,7 @@ def model_config(model: str) -> dict[str, Any] | None:
         return None
     cfg = dict(entry)
     if "location" not in cfg:
-        if cfg.get("api") == "embedContent":
+        if cfg.get("api") in ("embedContent", "rank"):
             cfg["location"] = "global"
         else:
             cfg["location"] = VERTEX_LOCATION
@@ -837,3 +841,76 @@ class VertexChatClient:
             # 정상 종료/에러/클라이언트 끊김(GeneratorExit) 모든 경로에서 닫는다.
             if entered:
                 await stream_ctx.__aexit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Vertex AI Rerank client
+# ---------------------------------------------------------------------------
+
+class VertexRerankClient:
+    """Vertex AI Search Ranking API (Rerank) 클라이언트."""
+
+    def __init__(self, token_provider: GoogleAccessTokenProvider | None = None) -> None:
+        self.token_provider = token_provider or GoogleAccessTokenProvider()
+        self.http = httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS))
+        self.semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def close(self) -> None:
+        await self.http.aclose()
+
+    def _rank_url(self, location: str) -> str:
+        project = self.token_provider.project_id
+        return (
+            f"https://discoveryengine.googleapis.com/"
+            f"v1/projects/{project}/locations/{location}/"
+            f"rankingConfigs/default_ranking_config:rank"
+        )
+
+    async def rank(
+        self,
+        *,
+        model: str,
+        query: str,
+        records: list[dict[str, Any]],
+        top_n: int | None = None,
+        ignore_record_details_in_response: bool = True,
+        location: str = "global",
+    ) -> list[dict[str, Any]]:
+        token = await self.token_provider.get_token()
+        url = self._rank_url(location)
+
+        body: dict[str, Any] = {
+            "query": query,
+            "records": records,
+            "ignoreRecordDetailsInResponse": ignore_record_details_in_response,
+        }
+        if top_n is not None:
+            body["topN"] = top_n
+        if model:
+            body["model"] = model
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        try:
+            async with self.semaphore:
+                resp = await self.http.post(url, headers=headers, json=body)
+        except httpx.TimeoutException as exc:
+            raise VertexAPIError(504, f"Vertex AI request timed out: {exc}", code="timeout") from exc
+        except httpx.RequestError as exc:
+            raise VertexAPIError(502, f"Vertex AI connection error: {exc}", code="connection_error") from exc
+
+        if resp.status_code >= 400:
+            raise _parse_vertex_error(resp)
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise VertexAPIError(502, f"Invalid JSON from Vertex AI: {exc}", code="bad_gateway") from exc
+
+        records_out = data.get("records")
+        if not isinstance(records_out, list):
+            if "records" not in data:
+                return []
+            raise VertexAPIError(502, "Malformed Vertex AI response: missing records[]", code="bad_gateway")
+
+        return records_out
