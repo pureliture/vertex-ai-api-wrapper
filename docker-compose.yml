@@ -6,7 +6,7 @@ services:
     container_name: vertex-embed-wrapper
     restart: unless-stopped
     ports:
-      - "8000:8000"        # RAGFlow가 같은 망이면 이 포트 노출은 선택사항
+      - "8930:8930"        # RAGFlow가 같은 망이면 이 포트 노출은 선택사항
     environment:
       VERTEX_PROJECT: ${VERTEX_PROJECT}
       VERTEX_LOCATION: ${VERTEX_LOCATION:-us-central1}
@@ -20,7 +20,7 @@ services:
     volumes:
       - ${VERTEX_SA_KEY_PATH:-./secrets/vertex-sa.json}:/app/secrets/vertex-sa.json:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8930/healthz').status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
