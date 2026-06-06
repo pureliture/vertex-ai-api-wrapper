@@ -2180,3 +2180,34 @@ async def test_stream_chat_error_before_stream_still_closes_context():
             pass
     assert state["aexit_called"] is True
     assert client.semaphore._value == 8
+
+
+# ---- gemini-3.5-flash (global generateContent) ----
+
+def test_gemini_35_flash_registered_as_global_chat():
+    cfg = vertex.model_config("gemini-3.5-flash")
+    assert cfg is not None
+    assert cfg["api"] == "generateContent"
+    assert cfg["kind"] == "chat"
+    assert cfg["location"] == "global"
+
+
+def test_chat_generate_url_global_has_no_region_prefix(mock_token_provider):
+    client = vertex.VertexChatClient()
+    url = client._generate_content_url("gemini-3.5-flash", "global")
+    assert url.startswith("https://aiplatform.googleapis.com/"), url
+    assert "/locations/global/" in url
+    assert "gemini-3.5-flash:generateContent" in url
+
+
+def test_chat_stream_url_global_has_no_region_prefix(mock_token_provider):
+    client = vertex.VertexChatClient()
+    url = client._stream_generate_content_url("gemini-3.5-flash", "global")
+    assert url.startswith("https://aiplatform.googleapis.com/"), url
+    assert ":streamGenerateContent?alt=sse" in url
+
+
+def test_chat_generate_url_regional_keeps_prefix(mock_token_provider):
+    client = vertex.VertexChatClient()
+    url = client._generate_content_url("gemini-2.5-flash", "us-central1")
+    assert url.startswith("https://us-central1-aiplatform.googleapis.com/"), url

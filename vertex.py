@@ -41,6 +41,7 @@ _BUILTIN_REGISTRY: dict[str, dict[str, Any]] = {
     # Chat models
     "gemini-2.5-flash": {"api": "generateContent", "kind": "chat", "location": "us-central1"},
     "gemini-2.5-pro": {"api": "generateContent", "kind": "chat", "location": "us-central1"},
+    "gemini-3.5-flash": {"api": "generateContent", "kind": "chat", "location": "global"},
 }
 
 def _build_registry() -> dict[str, dict[str, Any]]:
@@ -143,6 +144,13 @@ def _parse_vertex_error(resp: httpx.Response) -> VertexAPIError:
     return VertexAPIError(resp.status_code, message=message, code=str(code), raw=payload)
 
 
+def _vertex_host(location: str) -> str:
+    """Vertex AI 호스트. location이 'global'이면 region prefix가 없다."""
+    if location == "global":
+        return "aiplatform.googleapis.com"
+    return f"{location}-aiplatform.googleapis.com"
+
+
 def chunked(items: list[str], size: int) -> Iterable[list[str]]:
     size = max(1, size)
     for i in range(0, len(items), size):
@@ -200,20 +208,15 @@ class VertexEmbeddingClient:
     def _predict_url(self, model: str, location: str) -> str:
         project = self.token_provider.project_id
         return (
-            f"https://{location}-aiplatform.googleapis.com/"
+            f"https://{_vertex_host(location)}/"
             f"v1/projects/{project}/locations/{location}/"
             f"publishers/google/models/{model}:predict"
         )
 
     def _embed_content_url(self, model: str, location: str) -> str:
         project = self.token_provider.project_id
-        # location이 "global"이면 host에 region prefix 없음
-        if location == "global":
-            host = "aiplatform.googleapis.com"
-        else:
-            host = f"{location}-aiplatform.googleapis.com"
         return (
-            f"https://{host}/"
+            f"https://{_vertex_host(location)}/"
             f"v1/projects/{project}/locations/{location}/"
             f"publishers/google/models/{model}:embedContent"
         )
@@ -528,7 +531,7 @@ class VertexChatClient:
     def _generate_content_url(self, model: str, location: str) -> str:
         project = self.token_provider.project_id
         return (
-            f"https://{location}-aiplatform.googleapis.com/"
+            f"https://{_vertex_host(location)}/"
             f"v1/projects/{project}/locations/{location}/"
             f"publishers/google/models/{model}:generateContent"
         )
@@ -536,7 +539,7 @@ class VertexChatClient:
     def _stream_generate_content_url(self, model: str, location: str) -> str:
         project = self.token_provider.project_id
         return (
-            f"https://{location}-aiplatform.googleapis.com/"
+            f"https://{_vertex_host(location)}/"
             f"v1/projects/{project}/locations/{location}/"
             f"publishers/google/models/{model}:streamGenerateContent?alt=sse"
         )
