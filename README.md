@@ -11,20 +11,19 @@
 
 <br/>
 <div align="center">
-  <b>Google Cloud Vertex AI 임베딩 및 Rerank API를 RAGFlow(OpenAI/LocalAI 규격)에서 사용할 수 있게 해주는 프록시 서버입니다.</b>
+  <h3>Google Cloud Vertex AI 임베딩 및 Rerank API를 RAGFlow(OpenAI/LocalAI 규격)에서 사용할 수 있게 해주는 프록시 서버입니다.</h3>
 </div>
 <br/>
 
 <div align="center">
-  <a href="#-시스템-아키텍처">🏛️ 시스템 아키텍처</a> &nbsp;|&nbsp;
-  <a href="#-빠른-시작">🚀 빠른 시작</a> &nbsp;|&nbsp;
-  <a href="#-환경-변수-설정">⚙️ 환경 변수 설정</a> &nbsp;|&nbsp;
-  <a href="#-ragflow-연동-가이드">🎯 RAGFlow 연동</a> &nbsp;|&nbsp;
-  <a href="#-api-참조">📡 API 참조</a>
+  <a href="#-시스템-아키텍처"><img src="https://img.shields.io/badge/🏛️%20시스템%20아키텍처-555555?style=for-the-badge"/></a> &nbsp;|&nbsp;
+  <a href="#-빠른-시작"><img src="https://img.shields.io/badge/🚀%20빠른%20시작-555555?style=for-the-badge"/></a> &nbsp;|&nbsp;
+  <a href="#-환경-변수-설정"><img src="https://img.shields.io/badge/⚙️%20환경%20변수%20설정-555555?style=for-the-badge"/></a> &nbsp;|&nbsp;
+  <a href="#-ragflow-연동-가이드"><img src="https://img.shields.io/badge/🎯%20RAGFlow%20연동-555555?style=for-the-badge"/></a> &nbsp;|&nbsp;
+  <a href="#-api-참조"><img src="https://img.shields.io/badge/📡%20API%20참조-555555?style=for-the-badge"/></a>
 </div>
 
 ---
-
 
 <br/>
 
@@ -32,29 +31,32 @@
 
 ## 🏛️ 시스템 아키텍처
 
-<!-- docs/images/architecture.svg 위치에 다이어그램 삽입 -->
 
 ### 🎨 핵심 설계 포인트
 
 <table width="100%">
   <tr>
-    <td width="50%">
-      <h3>🟦 Drop-in Replacement</h3>
-      <p>기존 OpenAI/LocalAI 생태계 코드 변경 없이 Vertex AI를 그대로 사용 가능합니다.</p>
+    <td width="50%" valign="top">
+
+#### 🟦 Drop-in Replacement
+<p>기존 OpenAI/LocalAI 생태계 코드 변경 없이 Vertex AI를 그대로 사용 가능합니다.</p>
     </td>
-    <td width="50%">
-      <h3>🟩 Native Reranking</h3>
-      <p>RAGFlow의 <code>LocalAI</code> provider 규격을 통해 Vertex AI Search Ranking API를 완벽하게 연결합니다.</p>
+    <td width="50%" valign="top">
+
+#### 🟩 Native Reranking
+<p>RAGFlow의 <code>LocalAI</code> provider 규격을 통해 Vertex AI Search Ranking API를 완벽하게 연결합니다.</p>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <h3>🟪 Auto-Batching</h3>
-      <p>RAGFlow의 고정 배치(16개)를 Vertex AI의 모델별 한도(1~5개)에 맞춰 자동 분할 및 병렬 처리합니다.</p>
+    <td width="50%" valign="top">
+
+#### 🟪 Auto-Batching
+<p>RAGFlow의 고정 배치(16개)를 Vertex AI의 모델별 한도(1~5개)에 맞춰 자동 분할 및 병렬 처리합니다.</p>
     </td>
-    <td width="50%">
-      <h3>🟧 Auth Abstraction</h3>
-      <p>리프레시 토큰 관리 없이 ADC(Application Default Credentials) 서비스 계정을 통해 자동으로 OAuth2 토큰을 발급받습니다.</p>
+    <td width="50%" valign="top">
+
+#### 🟧 Auth Abstraction
+<p>리프레시 토큰 관리 없이 ADC(Application Default Credentials) 서비스 계정을 통해 자동으로 OAuth2 토큰을 발급받습니다.</p>
     </td>
   </tr>
 </table>
@@ -163,7 +165,7 @@ docker compose up -d --build
 </div>
 
 <div align="center">
-  <a href="#-시스템-아키텍처">🏛️ 아키텍처</a> &nbsp;|&nbsp;
-  <a href="#-빠른-시작">🚀 빠른 시작</a> &nbsp;|&nbsp;
-  <a href="#top">⬆️ 맨 위로</a>
+  <a href="#-시스템-아키텍처"><img src="https://img.shields.io/badge/🏛️%20아키텍처-555555?style=for-the-badge"/></a> &nbsp;|&nbsp;
+  <a href="#-빠른-시작"><img src="https://img.shields.io/badge/🚀%20빠른%20시작-555555?style=for-the-badge"/></a> &nbsp;|&nbsp;
+  <a href="#top"><img src="https://img.shields.io/badge/⬆️%20맨%20위로-555555?style=for-the-badge"/></a>
 </div>
