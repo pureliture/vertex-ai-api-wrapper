@@ -22,7 +22,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from vertex import VertexAPIError, VertexChatClient, VertexEmbeddingClient, allowed_models, model_config
+from vertex import (
+    SUPPORTED_RESPONSE_FORMAT_TYPES,
+    VertexAPIError,
+    VertexChatClient,
+    VertexEmbeddingClient,
+    allowed_models,
+    model_config,
+)
 
 SUPPORTED_TASK_TYPES = {
     "UNSPECIFIED",
@@ -70,6 +77,7 @@ class OpenAIChatRequest(BaseModel):
     stop: str | list[str] | None = None
     stream: bool | None = None
     user: str | None = None
+    response_format: dict[str, Any] | None = None
 
 
 def openai_error_response(
@@ -349,6 +357,7 @@ def _chat_completions_stream(
                 temperature=payload.temperature,
                 top_p=payload.top_p,
                 stop=payload.stop,
+                response_format=payload.response_format,
             ):
                 delta_text = event.get("delta_text", "") or ""
                 fr = event.get("finish_reason")
@@ -423,6 +432,20 @@ async def create_chat_completions(
             param="model",
         )
 
+    # response_format.type 유효성 검사: 지원하지 않는 type은 400으로 거부한다.
+    # 허용 타입은 vertex.SUPPORTED_RESPONSE_FORMAT_TYPES 단일 출처를 공유한다(드리프트 방지).
+    if payload.response_format is not None:
+        rf_type = payload.response_format.get("type")
+        if rf_type not in SUPPORTED_RESPONSE_FORMAT_TYPES:
+            return openai_error_response(
+                message=f"Unsupported response_format.type: {rf_type!r}. "
+                        f"Allowed: {sorted(SUPPORTED_RESPONSE_FORMAT_TYPES)}",
+                status_code=400,
+                error_type="invalid_request_error",
+                code="invalid_request",
+                param="response_format",
+            )
+
     chat_client: VertexChatClient = request.app.state.vertex_chat_client
 
     messages = [{"role": m.role, "content": m.content} for m in payload.messages]
@@ -438,6 +461,7 @@ async def create_chat_completions(
             temperature=payload.temperature,
             top_p=payload.top_p,
             stop=payload.stop,
+            response_format=payload.response_format,
         )
     except VertexAPIError as exc:
         return openai_error_response(
