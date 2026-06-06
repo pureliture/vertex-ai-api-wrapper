@@ -15,6 +15,8 @@ services:
       WRAPPER_API_KEY: ${WRAPPER_API_KEY:-}
       GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/vertex-sa.json
       MAX_CONCURRENCY: ${MAX_CONCURRENCY:-8}
+      EXTRA_MODELS: ${EXTRA_MODELS:-}
+      DEFAULT_MAX_INSTANCES: ${DEFAULT_MAX_INSTANCES:-1}
     volumes:
       - ${VERTEX_SA_KEY_PATH:-./secrets/vertex-sa.json}:/app/secrets/vertex-sa.json:ro
     healthcheck:
