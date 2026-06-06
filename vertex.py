@@ -460,6 +460,49 @@ class VertexEmbeddingClient:
 # Vertex AI Chat client (generateContent)
 # ---------------------------------------------------------------------------
 
+_RESPONSE_FORMAT_SANITIZE_KEYS = frozenset({"$schema", "$id", "$ref", "definitions", "$defs"})
+
+
+def _sanitize_schema(schema: Any) -> Any:
+    """JSON Schema에서 Vertex가 지원하지 않는 메타 키를 재귀적으로 제거한 새 구조를 반환한다.
+
+    원본을 변경하지 않고 새 dict/list를 반환한다.
+    제거 대상: $schema, $id, $ref, definitions, $defs
+    보존: type, properties, required, items, enum, description, propertyOrdering, additionalProperties 등
+    """
+    if isinstance(schema, dict):
+        return {
+            k: _sanitize_schema(v)
+            for k, v in schema.items()
+            if k not in _RESPONSE_FORMAT_SANITIZE_KEYS
+        }
+    if isinstance(schema, list):
+        return [_sanitize_schema(item) for item in schema]
+    return schema
+
+
+def _apply_response_format(gen_cfg: dict[str, Any], response_format: dict[str, Any] | None) -> None:
+    """response_format 매핑을 gen_cfg dict에 적용한다 (in-place).
+
+    - type=="json_object": responseMimeType = "application/json"
+    - type=="json_schema": responseMimeType = "application/json" + responseJsonSchema = sanitized schema
+    - type=="text" 또는 None: 변경 없음
+    """
+    if response_format is None:
+        return
+    fmt_type = response_format.get("type")
+    if fmt_type == "text" or fmt_type is None:
+        return
+    if fmt_type == "json_object":
+        gen_cfg["responseMimeType"] = "application/json"
+    elif fmt_type == "json_schema":
+        gen_cfg["responseMimeType"] = "application/json"
+        json_schema_obj = response_format.get("json_schema") or {}
+        raw_schema = json_schema_obj.get("schema") if isinstance(json_schema_obj, dict) else None
+        if raw_schema:
+            gen_cfg["responseJsonSchema"] = _sanitize_schema(raw_schema)
+
+
 def _map_finish_reason(vertex_reason: str) -> str:
     """Vertex finishReason -> OpenAI finish_reason 매핑."""
     return {
@@ -555,6 +598,7 @@ class VertexChatClient:
         top_p: float | None,
         stop: str | list[str] | None,
         thinking_budget: int | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """OpenAI messages/params -> Vertex generateContent request body.
 
@@ -594,6 +638,9 @@ class VertexChatClient:
         if thinking_budget is not None:
             gen_cfg["thinkingConfig"] = {"thinkingBudget": thinking_budget}
 
+        # --- response_format 매핑 (responseMimeType / responseJsonSchema) ---
+        _apply_response_format(gen_cfg, response_format)
+
         if gen_cfg:
             body["generationConfig"] = gen_cfg
 
@@ -608,6 +655,7 @@ class VertexChatClient:
         temperature: float | None = None,
         top_p: float | None = None,
         stop: str | list[str] | None = None,
+        response_format: dict | None = None,
     ) -> dict[str, Any]:
         """generateContent를 호출하고 정규화된 결과를 반환한다.
 
@@ -627,6 +675,7 @@ class VertexChatClient:
             top_p=top_p,
             stop=stop,
             thinking_budget=cfg.get("thinking_budget"),
+            response_format=response_format,
         )
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -683,6 +732,7 @@ class VertexChatClient:
         temperature: float | None = None,
         top_p: float | None = None,
         stop: str | list[str] | None = None,
+        response_format: dict | None = None,
     ):
         """streamGenerateContent(SSE)를 호출하고 델타를 순차 yield하는 async generator.
 
@@ -708,6 +758,7 @@ class VertexChatClient:
             top_p=top_p,
             stop=stop,
             thinking_budget=cfg.get("thinking_budget"),
+            response_format=response_format,
         )
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}

@@ -70,6 +70,7 @@ class OpenAIChatRequest(BaseModel):
     stop: str | list[str] | None = None
     stream: bool | None = None
     user: str | None = None
+    response_format: dict[str, Any] | None = None
 
 
 def openai_error_response(
@@ -349,6 +350,7 @@ def _chat_completions_stream(
                 temperature=payload.temperature,
                 top_p=payload.top_p,
                 stop=payload.stop,
+                response_format=payload.response_format,
             ):
                 delta_text = event.get("delta_text", "") or ""
                 fr = event.get("finish_reason")
@@ -423,6 +425,20 @@ async def create_chat_completions(
             param="model",
         )
 
+    # response_format.type 유효성 검사: 지원하지 않는 type은 400으로 거부한다.
+    _SUPPORTED_RESPONSE_FORMAT_TYPES = {"text", "json_object", "json_schema"}
+    if payload.response_format is not None:
+        rf_type = payload.response_format.get("type")
+        if rf_type not in _SUPPORTED_RESPONSE_FORMAT_TYPES:
+            return openai_error_response(
+                message=f"Unsupported response_format.type: {rf_type!r}. "
+                        f"Allowed: {sorted(_SUPPORTED_RESPONSE_FORMAT_TYPES)}",
+                status_code=400,
+                error_type="invalid_request_error",
+                code="invalid_request",
+                param="response_format",
+            )
+
     chat_client: VertexChatClient = request.app.state.vertex_chat_client
 
     messages = [{"role": m.role, "content": m.content} for m in payload.messages]
@@ -438,6 +454,7 @@ async def create_chat_completions(
             temperature=payload.temperature,
             top_p=payload.top_p,
             stop=payload.stop,
+            response_format=payload.response_format,
         )
     except VertexAPIError as exc:
         return openai_error_response(

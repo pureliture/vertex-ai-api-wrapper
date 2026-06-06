@@ -1393,7 +1393,7 @@ class _FakeChatService:
     def __init__(self, *_a, **_k):
         self.last_call: dict = {}
 
-    async def generate(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None):
+    async def generate(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None, response_format=None):
         self.last_call = {
             "model": model,
             "messages": messages,
@@ -1401,6 +1401,7 @@ class _FakeChatService:
             "temperature": temperature,
             "top_p": top_p,
             "stop": stop,
+            "response_format": response_format,
         }
         return {
             "text": "Hello, I am Gemini!",
@@ -1408,7 +1409,12 @@ class _FakeChatService:
             "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
         }
 
-    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None):
+    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None, response_format=None):
+        self.last_call = {
+            "model": model,
+            "messages": messages,
+            "response_format": response_format,
+        }
         yield {
             "delta_text": "Hello, I am Gemini!",
             "finish_reason": "stop",
@@ -1727,8 +1733,8 @@ class _FakeStreamingChatService:
     async def generate(self, **kw):
         return self._nonstream_result
 
-    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None):
-        self.last_call = {"model": model, "messages": messages}
+    async def stream_chat(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None, response_format=None):
+        self.last_call = {"model": model, "messages": messages, "response_format": response_format}
         deltas = [
             {"delta_text": "Hel", "finish_reason": None, "usage": None},
             {"delta_text": "lo!", "finish_reason": None, "usage": None},
@@ -2237,3 +2243,181 @@ def test_gemini_35_flash_has_thinking_budget_zero():
 
 def test_gemini_25_pro_has_no_thinking_budget():
     assert vertex.model_config("gemini-2.5-pro").get("thinking_budget") is None
+
+
+# ===========================================================================
+# response_format — vertex.py 단위 테스트 (_build_request_body)
+# ===========================================================================
+
+@pytest.mark.anyio
+async def test_response_format_json_object_sets_mime_type(chat_client):
+    """response_format={"type":"json_object"}이면 generationConfig.responseMimeType이 application/json이어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(
+        model="gemini-2.5-flash",
+        messages=messages,
+        response_format={"type": "json_object"},
+    )
+    body = mock_http.last_request["json"]
+    gen_cfg = body.get("generationConfig", {})
+    assert gen_cfg.get("responseMimeType") == "application/json"
+    assert "responseJsonSchema" not in gen_cfg
+
+
+@pytest.mark.anyio
+async def test_response_format_json_schema_sets_mime_type_and_schema(chat_client):
+    """response_format={"type":"json_schema",...}이면 responseMimeType + responseJsonSchema가 설정되어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    schema = {
+        "type": "object",
+        "properties": {"color": {"type": "string", "enum": ["red", "green", "blue"]}},
+        "required": ["color"],
+    }
+    await client.generate(
+        model="gemini-2.5-flash",
+        messages=messages,
+        response_format={"type": "json_schema", "json_schema": {"name": "MySchema", "schema": schema}},
+    )
+    body = mock_http.last_request["json"]
+    gen_cfg = body.get("generationConfig", {})
+    assert gen_cfg.get("responseMimeType") == "application/json"
+    actual_schema = gen_cfg.get("responseJsonSchema")
+    assert actual_schema is not None
+    # enum은 그대로 보존되어야 한다
+    assert actual_schema["properties"]["color"]["enum"] == ["red", "green", "blue"]
+
+
+@pytest.mark.anyio
+async def test_response_format_does_not_set_response_schema_old_field(chat_client):
+    """responseSchema (구 필드)는 절대 body에 포함되지 않아야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    for rf in [
+        {"type": "json_object"},
+        {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}},
+    ]:
+        await client.generate(
+            model="gemini-2.5-flash",
+            messages=messages,
+            response_format=rf,
+        )
+        body = mock_http.last_request["json"]
+        gen_cfg = body.get("generationConfig", {})
+        assert "responseSchema" not in gen_cfg, f"responseSchema found for {rf}"
+
+
+@pytest.mark.anyio
+async def test_response_format_absent_no_mime_type(chat_client):
+    """response_format 미제공 시 responseMimeType이 없고, generationConfig도 없어야 한다 (회귀)."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(model="gemini-2.5-pro", messages=messages)
+    body = mock_http.last_request["json"]
+    # generationConfig 자체가 없어야 한다 (기존 test_chat_no_generation_config_when_all_omitted 보완)
+    assert "generationConfig" not in body
+    # 혹시라도 있다면 responseMimeType 없어야 한다
+    assert "responseMimeType" not in body.get("generationConfig", {})
+
+
+@pytest.mark.anyio
+async def test_response_format_text_treated_as_no_structured_output(chat_client):
+    """response_format={"type":"text"}이면 구조적 출력 설정이 없어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(
+        model="gemini-2.5-pro",
+        messages=messages,
+        response_format={"type": "text"},
+    )
+    body = mock_http.last_request["json"]
+    # generationConfig 자체가 없어야 한다 (다른 gen 파라미터 없을 때)
+    assert "generationConfig" not in body
+
+
+# ===========================================================================
+# response_format — _sanitize_schema 단위 테스트
+# ===========================================================================
+
+def test_sanitize_schema_strips_dollar_schema_but_keeps_enum():
+    """_sanitize_schema는 $schema를 제거하고 enum/type/properties/required는 유지해야 한다."""
+    from vertex import _sanitize_schema
+    schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "my-schema",
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["ok", "fail"]},
+        },
+        "required": ["status"],
+        "$defs": {"helper": {"type": "string"}},
+    }
+    result = _sanitize_schema(schema)
+    # 제거되어야 하는 키
+    assert "$schema" not in result
+    assert "$id" not in result
+    assert "$defs" not in result
+    # 보존되어야 하는 키
+    assert result["type"] == "object"
+    assert result["required"] == ["status"]
+    assert result["properties"]["status"]["enum"] == ["ok", "fail"]
+
+
+def test_sanitize_schema_does_not_mutate_original():
+    """_sanitize_schema는 원본 dict를 변경하지 않아야 한다."""
+    from vertex import _sanitize_schema
+    original = {"$schema": "http://...", "type": "string"}
+    _ = _sanitize_schema(original)
+    assert "$schema" in original  # 원본 불변
+
+
+# ===========================================================================
+# response_format — 엔드포인트 테스트
+# ===========================================================================
+
+def test_chat_completions_unsupported_response_format_returns_400(chat_app_client):
+    """지원하지 않는 response_format.type은 HTTP 400 invalid_request_error를 반환해야 한다."""
+    client, _ = chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "response_format": {"type": "xml"},
+    })
+    assert r.status_code == 400
+    error = r.json()["error"]
+    assert error["type"] == "invalid_request_error"
+
+
+def test_chat_completions_json_schema_flows_to_fake_service(chat_app_client):
+    """json_schema response_format이 엔드포인트를 통해 fake service에 전달되어야 한다."""
+    client, fake_chat = chat_app_client
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "response_format": {"type": "json_schema", "json_schema": {"schema": schema}},
+    })
+    assert r.status_code == 200
+    # fake service의 last_call에 response_format이 기록되어야 한다
+    assert fake_chat.last_call.get("response_format") is not None
+    assert fake_chat.last_call["response_format"]["type"] == "json_schema"
+
+
+# ===========================================================================
+# response_format — 스트리밍 경로 전달 테스트
+# ===========================================================================
+
+def test_chat_completions_stream_response_format_forwarded(streaming_chat_app_client):
+    """streaming 경로에서도 response_format이 fake stream_chat에 전달되어야 한다."""
+    client, fake_chat = streaming_chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+        "response_format": {"type": "json_object"},
+    })
+    assert r.status_code == 200
+    # fake stream_chat last_call에 response_format이 기록되어야 한다
+    assert fake_chat.last_call.get("response_format") is not None
+    assert fake_chat.last_call["response_format"]["type"] == "json_object"
