@@ -78,6 +78,26 @@ RAGFlow 0.25.6은 입력 주소 끝에 `v1`을 자동으로 붙인다(`urljoin(b
 같은 docker-compose 망이면 컨테이너 이름으로 `http://vertex-embed-wrapper:8000`.
 래퍼가 호스트에서 단독 실행이고 RAGFlow가 컨테이너면 `http://host.docker.internal:8000`.
 
+## 범용 OpenAI 호환 (RAGFlow 외 다른 클라이언트)
+
+이 래퍼는 OpenAI 임베딩 표준을 구현하므로 RAGFlow뿐 아니라 OpenAI 호환 임베딩 클라이언트
+전반(LangChain, LlamaIndex, Dify, Open WebUI, LiteLLM, 직접 `openai` SDK)에 그대로 붙는다.
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://<host>:8000/v1", api_key="<WRAPPER_API_KEY 또는 아무값>")
+# encoding_format 미지정 -> openai SDK 기본 base64 전송 -> 래퍼가 처리 (drop-in)
+r = client.embeddings.create(model="text-embedding-005", input=["hello", "world"])
+print(len(r.data), len(r.data[0].embedding))
+```
+
+지원 항목:
+- `POST /v1/embeddings` — `encoding_format`: `float`(list) / `base64`(float32 LE, SDK 기본) 둘 다.
+- `GET /v1/models`, `GET /v1/models/{id}` — 모델 목록/조회(일부 클라이언트가 프로브).
+- 에러는 OpenAI 포맷(`{"error":{"message","type","code","param"}}`). 요청 검증 실패도 422가 아닌 OpenAI 400으로 변환.
+- CORS 허용(브라우저 클라이언트 OPTIONS preflight), trailing-slash 리다이렉트 비활성.
+- `model`은 화이트리스트(KNOWN + `EXTRA_MODELS`)만 허용 — 미등록 모델은 404(경로 주입 방지).
+
 ## 옵션 (요청 헤더)
 
 - `X-Vertex-Task-Type`: 호출별 task_type 덮어쓰기 (기본 `RETRIEVAL_DOCUMENT`).

@@ -20,5 +20,6 @@ pythonpath = ["."]
 
 [dependency-groups]
 dev = [
+    "openai>=2.41.0",
     "pytest>=9.0.3",
 ]

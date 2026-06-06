@@ -7,3 +7,4 @@ secrets/
 !.env.example
 .harnesskit/
 .pytest_cache/
+.DS_Store

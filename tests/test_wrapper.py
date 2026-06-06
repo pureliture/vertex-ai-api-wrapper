@@ -1,11 +1,13 @@
-"""래퍼의 순수 변환 로직 단위 테스트 (Vertex/GCP 호출 없이).
+"""래퍼의 변환/라우팅 로직 단위 테스트 (실제 Vertex/GCP 호출 없이).
 
-GoogleAccessTokenProvider는 import 시점이 아니라 lifespan에서 생성되므로,
-ADC 자격증명 없이도 app 모듈을 import하고 순수 함수/응답 매핑을 검증할 수 있다.
-실제 Vertex 호출 경로는 VertexEmbeddingClient.predict를 가짜로 주입해 테스트한다.
+lifespan을 실제로 돌리되 GoogleAccessTokenProvider/VertexEmbeddingClient를 가짜로
+monkeypatch해서, app.state(semaphore 포함)가 TestClient의 이벤트 루프에서 정상 구성되게 한다.
 """
 
 from __future__ import annotations
+
+import base64
+import struct
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,7 +35,6 @@ def test_chunked_splits_by_size():
 
 
 def test_chunked_size_floor_is_one():
-    # 한도 0이 들어와도 1로 보정
     assert list(wrapper.chunked(["a", "b"], 0)) == [["a"], ["b"]]
 
 
@@ -51,12 +52,24 @@ def test_status_mapping():
     assert wrapper.map_vertex_status_to_openai_type(400) == "invalid_request_error"
 
 
+def test_encode_embedding_float_passthrough():
+    assert wrapper.encode_embedding([0.1, 0.2], "float") == [0.1, 0.2]
+
+
+def test_encode_embedding_base64_roundtrip():
+    vals = [0.1, -0.2, 0.3]
+    s = wrapper.encode_embedding(vals, "base64")
+    assert isinstance(s, str)
+    back = list(struct.unpack(f"<{len(vals)}f", base64.b64decode(s)))
+    assert all(abs(a - b) < 1e-6 for a, b in zip(vals, back))
+
+
 # ---- 엔드포인트 (Vertex 호출은 가짜로 대체) ----
 
 class _FakeVertex:
-    """predict()를 흉내. 각 instance(text)당 한 개의 prediction을 돌려준다."""
+    """predict()를 흉내. instance(text)당 prediction 하나씩 반환."""
 
-    def __init__(self):
+    def __init__(self, *_a, **_k):
         self.calls: list[list[str]] = []
 
     async def predict(self, *, model, texts, dimensions, task_type, title, auto_truncate):
@@ -70,29 +83,25 @@ class _FakeVertex:
         pass
 
 
+class _FakeTokenProvider:
+    project_id = "test-project"
+
+    def __init__(self, *_a, **_k):
+        pass
+
+
 @pytest.fixture
 def client_with_fake(monkeypatch):
     fake = _FakeVertex()
-
-    # lifespan이 GoogleAccessTokenProvider/VertexEmbeddingClient를 만들지 않도록 우회:
-    # 테스트에서는 lifespan을 끄고 app.state를 직접 채운다.
-    test_app = wrapper.app
-    test_app.router.lifespan_context = _noop_lifespan
-    with TestClient(test_app) as c:
-        test_app.state.vertex_client = fake
+    # 실제 lifespan이 돌되 GCP 의존성만 가짜로 교체 -> semaphore 등 app.state가 in-loop 구성됨.
+    monkeypatch.setattr(wrapper, "GoogleAccessTokenProvider", _FakeTokenProvider)
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda _tp: fake)
+    with TestClient(wrapper.app) as c:
         yield c, fake
 
 
-from contextlib import asynccontextmanager
-
-
-@asynccontextmanager
-async def _noop_lifespan(app):
-    yield
-
-
 def test_embeddings_order_and_usage(client_with_fake):
-    client, fake = client_with_fake
+    client, _ = client_with_fake
     r = client.post("/v1/embeddings", json={"model": "text-embedding-005", "input": ["a", "b", "c"]})
     assert r.status_code == 200
     body = r.json()
@@ -105,19 +114,77 @@ def test_embeddings_order_and_usage(client_with_fake):
 def test_gemini_001_splits_into_single_instance_calls(client_with_fake):
     client, fake = client_with_fake
     client.post("/v1/embeddings", json={"model": "gemini-embedding-001", "input": ["x", "y", "z"]})
-    # 한도 1 -> 3번의 1개짜리 호출로 쪼개져야 함
     assert sorted(len(c) for c in fake.calls) == [1, 1, 1]
 
 
 def test_text_005_splits_by_five(client_with_fake):
     client, fake = client_with_fake
     client.post("/v1/embeddings", json={"model": "text-embedding-005", "input": [str(i) for i in range(12)]})
-    # 한도 5 -> 5,5,2
     assert sorted((len(c) for c in fake.calls), reverse=True) == [5, 5, 2]
 
 
-def test_rejects_non_float_encoding(client_with_fake):
+def test_base64_response_roundtrip(client_with_fake):
     client, _ = client_with_fake
-    r = client.post("/v1/embeddings", json={"model": "text-embedding-005", "input": "a", "encoding_format": "base64"})
+    r = client.post(
+        "/v1/embeddings",
+        json={"model": "text-embedding-005", "input": ["a"], "encoding_format": "base64"},
+    )
+    assert r.status_code == 200
+    emb = r.json()["data"][0]["embedding"]
+    assert isinstance(emb, str)
+    back = list(struct.unpack("<3f", base64.b64decode(emb)))
+    assert all(abs(a - b) < 1e-6 for a, b in zip([0.1, 0.2, 0.3], back))
+
+
+def test_float_still_returns_list(client_with_fake):
+    client, _ = client_with_fake
+    r = client.post(
+        "/v1/embeddings",
+        json={"model": "text-embedding-005", "input": ["a"], "encoding_format": "float"},
+    )
+    assert isinstance(r.json()["data"][0]["embedding"], list)
+
+
+def test_unknown_model_rejected(client_with_fake):
+    client, fake = client_with_fake
+    r = client.post("/v1/embeddings", json={"model": "../evil", "input": "a"})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
+    assert fake.calls == []  # Vertex 호출 전에 차단
+
+
+def test_invalid_encoding_format_is_openai_error(client_with_fake):
+    client, _ = client_with_fake
+    r = client.post(
+        "/v1/embeddings",
+        json={"model": "text-embedding-005", "input": "a", "encoding_format": "xml"},
+    )
     assert r.status_code == 400
-    assert r.json()["error"]["code"] == "unsupported_encoding_format"
+    assert r.json()["error"]["type"] == "invalid_request_error"  # 422 default 아님
+
+
+def test_list_models(client_with_fake):
+    client, _ = client_with_fake
+    r = client.get("/v1/models")
+    assert r.status_code == 200
+    ids = {m["id"] for m in r.json()["data"]}
+    assert {"gemini-embedding-001", "text-embedding-005"} <= ids
+
+
+def test_retrieve_model_known_and_unknown(client_with_fake):
+    client, _ = client_with_fake
+    assert client.get("/v1/models/text-embedding-005").status_code == 200
+    assert client.get("/v1/models/nope").status_code == 404
+
+
+def test_wrapper_api_key_enforced(client_with_fake, monkeypatch):
+    client, _ = client_with_fake
+    monkeypatch.setattr(wrapper, "WRAPPER_API_KEY", "secret-key")
+    bad = client.post("/v1/embeddings", json={"model": "text-embedding-005", "input": "a"})
+    assert bad.status_code == 401
+    ok = client.post(
+        "/v1/embeddings",
+        headers={"Authorization": "Bearer secret-key"},
+        json={"model": "text-embedding-005", "input": "a"},
+    )
+    assert ok.status_code == 200
