@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from vertex import VertexAPIError, VertexEmbeddingClient, allowed_models
+from vertex import VertexAPIError, VertexChatClient, VertexEmbeddingClient, allowed_models, model_config
 
 SUPPORTED_TASK_TYPES = {
     "UNSPECIFIED",
@@ -47,6 +47,26 @@ class OpenAIEmbeddingsRequest(BaseModel):
     model: str
     encoding_format: Literal["float", "base64"] = "float"
     dimensions: int | None = None
+    user: str | None = None
+
+
+class OpenAIChatMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    role: str
+    content: str | list[Any]
+
+
+class OpenAIChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    messages: list[OpenAIChatMessage]
+    temperature: float | None = None
+    max_tokens: int | None = None
+    top_p: float | None = None
+    stop: str | list[str] | None = None
+    stream: bool | None = None
     user: str | None = None
 
 
@@ -93,10 +113,12 @@ def encode_embedding(values: list[float], fmt: str) -> list[float] | str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.vertex_client = VertexEmbeddingClient()
+    app.state.vertex_chat_client = VertexChatClient()
     try:
         yield
     finally:
         await app.state.vertex_client.close()
+        await app.state.vertex_chat_client.close()
 
 
 app = FastAPI(title="Vertex AI OpenAI-Compatible Embeddings Wrapper", version="0.1.0", lifespan=lifespan)
@@ -192,6 +214,16 @@ async def create_embeddings(
             param="model",
         )
 
+    _embed_cfg = model_config(payload.model)
+    if _embed_cfg and _embed_cfg.get("kind") != "embedding":
+        return openai_error_response(
+            message=f"The model '{payload.model}' is not an embedding model.",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_model",
+            param="model",
+        )
+
     if payload.dimensions is not None and payload.dimensions < 1:
         return openai_error_response(
             message="dimensions must be >= 1.",
@@ -276,4 +308,82 @@ async def create_embeddings(
         "data": data,
         "model": payload.model,
         "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+    }
+
+
+@app.post("/v1/chat/completions", response_model=None)
+async def create_chat_completions(
+    payload: OpenAIChatRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse | dict[str, Any]:
+    if WRAPPER_API_KEY and authorization != f"Bearer {WRAPPER_API_KEY}":
+        return openai_error_response(
+            message="Invalid wrapper API key.",
+            status_code=401,
+            error_type="authentication_error",
+            code="invalid_api_key",
+        )
+
+    if payload.model not in ALLOWED_MODELS:
+        return openai_error_response(
+            message=f"The model '{payload.model}' does not exist.",
+            status_code=404,
+            error_type="invalid_request_error",
+            code="model_not_found",
+            param="model",
+        )
+
+    _chat_cfg = model_config(payload.model)
+    if _chat_cfg and _chat_cfg.get("kind") != "chat":
+        return openai_error_response(
+            message=f"The model '{payload.model}' is not a chat model.",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_model",
+            param="model",
+        )
+
+    if payload.stream:
+        return openai_error_response(
+            message="Streaming is not supported by this wrapper. Set stream=false.",
+            status_code=400,
+            error_type="invalid_request_error",
+            code="streaming_not_supported",
+        )
+
+    chat_client: VertexChatClient = request.app.state.vertex_chat_client
+
+    messages = [{"role": m.role, "content": m.content} for m in payload.messages]
+
+    try:
+        result = await chat_client.generate(
+            model=payload.model,
+            messages=messages,
+            max_tokens=payload.max_tokens,
+            temperature=payload.temperature,
+            top_p=payload.top_p,
+            stop=payload.stop,
+        )
+    except VertexAPIError as exc:
+        return openai_error_response(
+            message=exc.message,
+            status_code=exc.status_code,
+            error_type=map_vertex_status_to_openai_type(exc.status_code),
+            code=exc.code,
+        )
+
+    return {
+        "id": "chatcmpl-vertex",
+        "object": "chat.completion",
+        "created": 0,
+        "model": payload.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": result["text"]},
+                "finish_reason": result["finish_reason"],
+            }
+        ],
+        "usage": result["usage"],
     }

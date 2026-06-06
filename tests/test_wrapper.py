@@ -579,11 +579,30 @@ class _FakeVertexService:
         pass
 
 
+class _FakeVertexChatService:
+    """VertexChatClient 기본 흉내 (embedding 테스트에서 lifespan 오류 방지용)."""
+
+    def __init__(self, *_a, **_k):
+        pass
+
+    async def generate(self, **kw):
+        return {
+            "text": "fake",
+            "finish_reason": "stop",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    async def close(self):
+        pass
+
+
 @pytest.fixture
 def client_with_fake(monkeypatch):
     fake = _FakeVertexService()
-    # app.py의 lifespan에서 생성되는 VertexEmbeddingClient 교체
+    fake_chat = _FakeVertexChatService()
+    # app.py의 lifespan에서 생성되는 VertexEmbeddingClient / VertexChatClient 교체
     monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake)
+    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
     with TestClient(wrapper.app) as c:
         yield c, fake
 
@@ -888,3 +907,623 @@ def test_registry_missing_api_raises(monkeypatch):
         importlib.reload(vertex)
     monkeypatch.delenv("MODEL_REGISTRY_JSON", raising=False)
     importlib.reload(vertex)
+
+
+# ===========================================================================
+# Chat Completions — Registry & kind field
+# ===========================================================================
+
+def test_chat_models_in_registry():
+    """gemini-2.5-flash, gemini-2.5-pro가 레지스트리에 kind='chat'으로 있어야 한다."""
+    reg = vertex.MODEL_REGISTRY
+    assert "gemini-2.5-flash" in reg
+    assert "gemini-2.5-pro" in reg
+    assert reg["gemini-2.5-flash"].get("kind") == "chat"
+    assert reg["gemini-2.5-pro"].get("kind") == "chat"
+
+
+def test_chat_models_api_is_generate_content():
+    """채팅 모델의 api는 'generateContent'여야 한다."""
+    reg = vertex.MODEL_REGISTRY
+    assert reg["gemini-2.5-flash"]["api"] == "generateContent"
+    assert reg["gemini-2.5-pro"]["api"] == "generateContent"
+
+
+def test_embedding_models_resolve_kind_embedding():
+    """기존 임베딩 모델은 model_config()에서 kind='embedding'을 반환해야 한다."""
+    cfg = vertex.model_config("text-embedding-005")
+    assert cfg is not None
+    assert cfg.get("kind") == "embedding"
+
+    cfg2 = vertex.model_config("gemini-embedding-2")
+    assert cfg2 is not None
+    assert cfg2.get("kind") == "embedding"
+
+
+def test_chat_model_config_resolves_kind():
+    """채팅 모델의 model_config()에서 kind='chat'이 포함되어야 한다."""
+    cfg = vertex.model_config("gemini-2.5-flash")
+    assert cfg is not None
+    assert cfg.get("kind") == "chat"
+    assert cfg.get("location") == "us-central1"
+
+
+def test_api_validation_allows_generate_content(monkeypatch):
+    """MODEL_REGISTRY_JSON으로 generateContent api 모델을 추가할 수 있어야 한다."""
+    import importlib
+    custom = json.dumps({
+        "my-chat-model": {"api": "generateContent", "kind": "chat", "location": "us-central1"}
+    })
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", custom)
+    importlib.reload(vertex)
+    try:
+        assert "my-chat-model" in vertex.MODEL_REGISTRY
+        assert vertex.MODEL_REGISTRY["my-chat-model"]["api"] == "generateContent"
+    finally:
+        monkeypatch.delenv("MODEL_REGISTRY_JSON", raising=False)
+        importlib.reload(vertex)
+
+
+def test_model_registry_json_can_add_chat_model(monkeypatch):
+    """MODEL_REGISTRY_JSON 환경변수로 kind='chat' 모델을 추가할 수 있어야 한다."""
+    import importlib
+    custom = json.dumps({
+        "custom-chat-v1": {"api": "generateContent", "kind": "chat", "location": "us-east1"}
+    })
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", custom)
+    importlib.reload(vertex)
+    try:
+        cfg = vertex.model_config("custom-chat-v1")
+        assert cfg is not None
+        assert cfg.get("kind") == "chat"
+        assert cfg.get("location") == "us-east1"
+        # 기존 모델도 유지되어야 한다
+        assert "text-embedding-005" in vertex.MODEL_REGISTRY
+    finally:
+        monkeypatch.delenv("MODEL_REGISTRY_JSON", raising=False)
+        importlib.reload(vertex)
+
+
+def test_allowed_models_includes_chat_models():
+    """allowed_models()에 chat 모델도 포함되어야 한다."""
+    models = vertex.allowed_models()
+    assert "gemini-2.5-flash" in models
+    assert "gemini-2.5-pro" in models
+
+
+# ===========================================================================
+# Chat Completions — Message mapping (VertexChatClient)
+# ===========================================================================
+
+@pytest.fixture
+def chat_client(monkeypatch):
+    """VertexChatClient 인스턴스를 반환 (httpx mock 없이)."""
+    import httpx
+
+    class MockChatHttpClient:
+        def __init__(self, *a, **kw):
+            self.last_request: dict = {}
+
+        async def post(self, url, *, headers=None, json=None):
+            self.last_request = {"url": url, "headers": headers, "json": json}
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "Hello!"}]},
+                        "finishReason": "STOP",
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 7,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 8,
+                    },
+                },
+                "text": "{}",
+            })()
+
+        async def aclose(self):
+            pass
+
+    mock_http = MockChatHttpClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: mock_http)
+    monkeypatch.setattr(vertex, "GoogleAccessTokenProvider", lambda: type("FTP", (), {
+        "project_id": "test-project",
+        "get_token": lambda self: __import__("asyncio").coroutine(lambda: "fake-token")(),
+    })())
+
+    class FakeTokenProvider:
+        def __init__(self):
+            self.project_id = "test-project"
+
+        async def get_token(self):
+            return "fake-token"
+
+    client = vertex.VertexChatClient(token_provider=FakeTokenProvider())
+    client.http = mock_http
+    return client, mock_http
+
+
+@pytest.mark.anyio
+async def test_chat_system_message_becomes_system_instruction(chat_client):
+    """system role 메시지는 Vertex systemInstruction으로 매핑되어야 한다."""
+    client, mock_http = chat_client
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hi"},
+    ]
+    await client.generate(
+        model="gemini-2.5-flash",
+        messages=messages,
+    )
+    body = mock_http.last_request["json"]
+    assert "systemInstruction" in body
+    assert body["systemInstruction"]["parts"][0]["text"] == "You are helpful."
+
+
+@pytest.mark.anyio
+async def test_chat_user_message_maps_to_user_role(chat_client):
+    """user role 메시지는 Vertex contents의 role='user'로 매핑되어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hello"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages)
+    body = mock_http.last_request["json"]
+    contents = body.get("contents", [])
+    assert len(contents) == 1
+    assert contents[0]["role"] == "user"
+    assert contents[0]["parts"][0]["text"] == "Hello"
+
+
+@pytest.mark.anyio
+async def test_chat_assistant_message_maps_to_model_role(chat_client):
+    """assistant role 메시지는 Vertex contents의 role='model'로 매핑되어야 한다."""
+    client, mock_http = chat_client
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there"},
+    ]
+    await client.generate(model="gemini-2.5-flash", messages=messages)
+    body = mock_http.last_request["json"]
+    contents = body.get("contents", [])
+    assert len(contents) == 2
+    assert contents[1]["role"] == "model"
+    assert contents[1]["parts"][0]["text"] == "Hi there"
+
+
+@pytest.mark.anyio
+async def test_chat_multiple_messages_preserve_order(chat_client):
+    """여러 메시지가 순서대로 contents에 들어가야 한다."""
+    client, mock_http = chat_client
+    messages = [
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "Second"},
+        {"role": "user", "content": "Third"},
+    ]
+    await client.generate(model="gemini-2.5-flash", messages=messages)
+    body = mock_http.last_request["json"]
+    contents = body.get("contents", [])
+    assert len(contents) == 3
+    assert contents[0]["parts"][0]["text"] == "First"
+    assert contents[1]["parts"][0]["text"] == "Second"
+    assert contents[2]["parts"][0]["text"] == "Third"
+
+
+@pytest.mark.anyio
+async def test_chat_multiple_system_messages_concatenated(chat_client):
+    """여러 system 메시지는 하나의 systemInstruction으로 합쳐져야 한다."""
+    client, mock_http = chat_client
+    messages = [
+        {"role": "system", "content": "Part1."},
+        {"role": "system", "content": "Part2."},
+        {"role": "user", "content": "Hi"},
+    ]
+    await client.generate(model="gemini-2.5-flash", messages=messages)
+    body = mock_http.last_request["json"]
+    assert "systemInstruction" in body
+    parts = body["systemInstruction"]["parts"]
+    combined = " ".join(p["text"] for p in parts)
+    assert "Part1." in combined
+    assert "Part2." in combined
+
+
+@pytest.mark.anyio
+async def test_chat_no_system_message_omits_system_instruction(chat_client):
+    """system 메시지가 없으면 systemInstruction 키가 없어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hello"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages)
+    body = mock_http.last_request["json"]
+    assert "systemInstruction" not in body
+
+
+@pytest.mark.anyio
+async def test_chat_content_as_list_of_parts_extracts_text(chat_client):
+    """content가 {type:'text', text:...} 리스트 형태여도 텍스트를 추출해야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Hello from list"}]}]
+    await client.generate(model="gemini-2.5-flash", messages=messages)
+    body = mock_http.last_request["json"]
+    contents = body.get("contents", [])
+    assert contents[0]["parts"][0]["text"] == "Hello from list"
+
+
+# ===========================================================================
+# Chat Completions — generationConfig mapping
+# ===========================================================================
+
+@pytest.mark.anyio
+async def test_chat_max_tokens_maps_to_max_output_tokens(chat_client):
+    """max_tokens는 generationConfig.maxOutputTokens로 매핑되어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages, max_tokens=100)
+    body = mock_http.last_request["json"]
+    assert body.get("generationConfig", {}).get("maxOutputTokens") == 100
+
+
+@pytest.mark.anyio
+async def test_chat_temperature_maps(chat_client):
+    """temperature는 generationConfig.temperature로 매핑되어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages, temperature=0.7)
+    body = mock_http.last_request["json"]
+    assert body.get("generationConfig", {}).get("temperature") == 0.7
+
+
+@pytest.mark.anyio
+async def test_chat_top_p_maps(chat_client):
+    """top_p는 generationConfig.topP로 매핑되어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages, top_p=0.9)
+    body = mock_http.last_request["json"]
+    assert body.get("generationConfig", {}).get("topP") == 0.9
+
+
+@pytest.mark.anyio
+async def test_chat_stop_string_maps_to_list(chat_client):
+    """stop이 문자열이면 stopSequences 단일 원소 리스트로 매핑되어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages, stop="END")
+    body = mock_http.last_request["json"]
+    assert body.get("generationConfig", {}).get("stopSequences") == ["END"]
+
+
+@pytest.mark.anyio
+async def test_chat_stop_list_maps(chat_client):
+    """stop이 리스트이면 stopSequences로 그대로 매핑되어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages, stop=["END", "STOP"])
+    body = mock_http.last_request["json"]
+    assert body.get("generationConfig", {}).get("stopSequences") == ["END", "STOP"]
+
+
+@pytest.mark.anyio
+async def test_chat_omitted_params_absent_from_generation_config(chat_client):
+    """제공되지 않은 파라미터는 generationConfig에 없어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages)
+    body = mock_http.last_request["json"]
+    gen_cfg = body.get("generationConfig", {})
+    assert "maxOutputTokens" not in gen_cfg
+    assert "temperature" not in gen_cfg
+    assert "topP" not in gen_cfg
+    assert "stopSequences" not in gen_cfg
+
+
+@pytest.mark.anyio
+async def test_chat_no_generation_config_when_all_omitted(chat_client):
+    """생성 파라미터가 모두 없으면 generationConfig 자체가 없어야 한다."""
+    client, mock_http = chat_client
+    messages = [{"role": "user", "content": "Hi"}]
+    await client.generate(model="gemini-2.5-flash", messages=messages)
+    body = mock_http.last_request["json"]
+    assert "generationConfig" not in body
+
+
+# ===========================================================================
+# Chat Completions — Response parsing
+# ===========================================================================
+
+@pytest.mark.anyio
+async def test_chat_response_text_extracted(chat_client):
+    """응답에서 텍스트가 올바르게 추출되어야 한다."""
+    client, _ = chat_client
+    result = await client.generate(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    )
+    assert result["text"] == "Hello!"
+
+
+@pytest.mark.anyio
+async def test_chat_response_usage_extracted(chat_client):
+    """응답의 usageMetadata가 usage dict로 변환되어야 한다."""
+    client, _ = chat_client
+    result = await client.generate(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    )
+    usage = result["usage"]
+    assert usage["prompt_tokens"] == 7
+    assert usage["completion_tokens"] == 1
+    assert usage["total_tokens"] == 8
+
+
+@pytest.mark.anyio
+async def test_chat_finish_reason_stop_mapped(monkeypatch):
+    """finishReason 'STOP'은 'stop'으로 매핑되어야 한다."""
+    import httpx
+
+    class FakeTokenProvider:
+        def __init__(self):
+            self.project_id = "test-project"
+        async def get_token(self):
+            return "fake-token"
+
+    class MockHttp:
+        async def post(self, url, *, headers=None, json=None):
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {
+                    "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+                },
+                "text": "{}",
+            })()
+        async def aclose(self): pass
+
+    client = vertex.VertexChatClient(token_provider=FakeTokenProvider())
+    client.http = MockHttp()
+    result = await client.generate(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    )
+    assert result["finish_reason"] == "stop"
+
+
+@pytest.mark.anyio
+async def test_chat_finish_reason_max_tokens_mapped(monkeypatch):
+    """finishReason 'MAX_TOKENS'은 'length'로 매핑되어야 한다."""
+    import httpx
+
+    class FakeTokenProvider:
+        def __init__(self):
+            self.project_id = "test-project"
+        async def get_token(self):
+            return "fake-token"
+
+    class MockHttp:
+        async def post(self, url, *, headers=None, json=None):
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {
+                    "candidates": [{"content": {"role": "model", "parts": [{"text": "truncated"}]}, "finishReason": "MAX_TOKENS"}],
+                    "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 10, "totalTokenCount": 15},
+                },
+                "text": "{}",
+            })()
+        async def aclose(self): pass
+
+    client = vertex.VertexChatClient(token_provider=FakeTokenProvider())
+    client.http = MockHttp()
+    result = await client.generate(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    )
+    assert result["finish_reason"] == "length"
+
+
+@pytest.mark.anyio
+async def test_chat_finish_reason_safety_mapped(monkeypatch):
+    """finishReason 'SAFETY'는 'content_filter'로 매핑되어야 한다."""
+    import httpx
+
+    class FakeTokenProvider:
+        def __init__(self):
+            self.project_id = "test-project"
+        async def get_token(self):
+            return "fake-token"
+
+    class MockHttp:
+        async def post(self, url, *, headers=None, json=None):
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {
+                    "candidates": [{"content": {"role": "model", "parts": []}, "finishReason": "SAFETY"}],
+                    "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0, "totalTokenCount": 3},
+                },
+                "text": "{}",
+            })()
+        async def aclose(self): pass
+
+    client = vertex.VertexChatClient(token_provider=FakeTokenProvider())
+    client.http = MockHttp()
+    result = await client.generate(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    )
+    assert result["finish_reason"] == "content_filter"
+    assert result["text"] == ""
+
+
+@pytest.mark.anyio
+async def test_chat_candidate_without_parts_returns_empty_text(monkeypatch):
+    """candidate에 parts가 없으면 text=''으로 처리해야 한다."""
+    import httpx
+
+    class FakeTokenProvider:
+        def __init__(self):
+            self.project_id = "test-project"
+        async def get_token(self):
+            return "fake-token"
+
+    class MockHttp:
+        async def post(self, url, *, headers=None, json=None):
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self: {
+                    "candidates": [{"content": {"role": "model"}, "finishReason": "SAFETY"}],
+                    "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0, "totalTokenCount": 3},
+                },
+                "text": "{}",
+            })()
+        async def aclose(self): pass
+
+    client = vertex.VertexChatClient(token_provider=FakeTokenProvider())
+    client.http = MockHttp()
+    result = await client.generate(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hi"}],
+    )
+    assert result["text"] == ""
+
+
+# ===========================================================================
+# Chat Completions — /v1/chat/completions endpoint
+# ===========================================================================
+
+class _FakeChatService:
+    """VertexChatClient 흉내."""
+
+    def __init__(self, *_a, **_k):
+        self.last_call: dict = {}
+
+    async def generate(self, *, model, messages, max_tokens=None, temperature=None, top_p=None, stop=None):
+        self.last_call = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stop": stop,
+        }
+        return {
+            "text": "Hello, I am Gemini!",
+            "finish_reason": "stop",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
+        }
+
+    async def close(self):
+        pass
+
+
+@pytest.fixture
+def chat_app_client(monkeypatch):
+    """chat completions 엔드포인트 테스트용 TestClient."""
+    fake_chat = _FakeChatService()
+    fake_embed = _FakeVertexService()
+    monkeypatch.setattr(wrapper, "VertexEmbeddingClient", lambda: fake_embed)
+    monkeypatch.setattr(wrapper, "VertexChatClient", lambda: fake_chat)
+    with TestClient(wrapper.app) as c:
+        yield c, fake_chat
+
+
+def test_chat_completions_returns_openai_shape(chat_app_client):
+    """POST /v1/chat/completions가 올바른 OpenAI ChatCompletion 형태를 반환해야 한다."""
+    client, _ = chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"] == "chat.completion"
+    assert "id" in body
+    assert body["id"].startswith("chatcmpl-")
+    assert body["model"] == "gemini-2.5-flash"
+    choices = body["choices"]
+    assert len(choices) == 1
+    assert choices[0]["index"] == 0
+    assert choices[0]["message"]["role"] == "assistant"
+    assert choices[0]["message"]["content"] == "Hello, I am Gemini!"
+    assert choices[0]["finish_reason"] == "stop"
+    usage = body["usage"]
+    assert usage["prompt_tokens"] == 5
+    assert usage["completion_tokens"] == 6
+    assert usage["total_tokens"] == 11
+
+
+def test_chat_completions_stream_true_returns_error(chat_app_client):
+    """stream=true이면 400 streaming_not_supported 에러를 반환해야 한다."""
+    client, _ = chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    assert r.status_code == 400
+    error = r.json()["error"]
+    assert error["code"] == "streaming_not_supported"
+    assert error["type"] == "invalid_request_error"
+
+
+def test_chat_completions_unknown_model_returns_404(chat_app_client):
+    """존재하지 않는 모델은 404 model_not_found를 반환해야 한다."""
+    client, _ = chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "nonexistent-model-xyz",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
+
+
+def test_chat_completions_embedding_model_returns_error(chat_app_client):
+    """임베딩 모델을 chat 엔드포인트에 사용하면 에러를 반환해야 한다."""
+    client, _ = chat_app_client
+    r = client.post("/v1/chat/completions", json={
+        "model": "text-embedding-005",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    assert r.status_code == 400
+    error = r.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert "not a chat model" in error["message"].lower() or "embedding" in error["message"].lower()
+
+
+def test_chat_completions_auth_enforced(chat_app_client, monkeypatch):
+    """WRAPPER_API_KEY가 설정된 경우 인증이 강제되어야 한다."""
+    client, _ = chat_app_client
+    monkeypatch.setattr(wrapper, "WRAPPER_API_KEY", "secret-key")
+    bad = client.post("/v1/chat/completions", json={
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    assert bad.status_code == 401
+
+    ok = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer secret-key"},
+        json={
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
+    assert ok.status_code == 200
+
+
+def test_chat_model_rejected_on_embeddings_endpoint(chat_app_client):
+    """채팅 모델을 /v1/embeddings 엔드포인트에 사용하면 에러를 반환해야 한다."""
+    client, _ = chat_app_client
+    r = client.post("/v1/embeddings", json={
+        "model": "gemini-2.5-flash",
+        "input": ["hello"],
+    })
+    assert r.status_code == 400
+    error = r.json()["error"]
+    assert error["type"] == "invalid_request_error"
+
+
+def test_list_models_includes_chat_models(chat_app_client):
+    """GET /v1/models 응답에 chat 모델도 포함되어야 한다."""
+    client, _ = chat_app_client
+    r = client.get("/v1/models")
+    assert r.status_code == 200
+    ids = {m["id"] for m in r.json()["data"]}
+    assert "gemini-2.5-flash" in ids
+    assert "gemini-2.5-pro" in ids
