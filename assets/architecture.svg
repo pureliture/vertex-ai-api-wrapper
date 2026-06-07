@@ -19,7 +19,7 @@
 
       <!-- Client Layer -->
       <rect x="50" y="50" width="200" height="400" rx="10" fill="#313244" filter="url(#shadow)"/>
-      <text x="150" y="90" font-family="sans-serif" font-size="18" font-weight="bold" fill="#f5e0dc" text-anchor="middle">Clients (RAGFlow)</text>
+      <text x="150" y="90" font-family="sans-serif" font-size="18" font-weight="bold" fill="#f5e0dc" text-anchor="middle">AI Clients</text>
       
       <rect x="70" y="130" width="160" height="60" rx="5" fill="url(#gradClient)" filter="url(#shadow)"/>
       <text x="150" y="165" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1e1e2e" text-anchor="middle">OpenAI Compatible</text>
